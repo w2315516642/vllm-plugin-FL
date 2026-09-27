@@ -3835,6 +3835,7 @@ class ModelRunnerFL(
         finally:
             self.prepare_inputs_event.record()
 
+    @torch.cuda.nvtx.range("FL.ModelRunner._model_forward")
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -4121,6 +4122,7 @@ class ModelRunnerFL(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    @torch.cuda.nvtx.range("FL.ModelRunner.execute_model")
     @managed_inference_mode()
     def execute_model(
         self,
@@ -4500,6 +4502,7 @@ class ModelRunnerFL(
             <= self.effective_drafter_max_model_len
         )
 
+    @torch.cuda.nvtx.range("FL.ModelRunner.sample_tokens")
     @managed_inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
