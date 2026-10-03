@@ -40,6 +40,7 @@ if is_flash_attn_varlen_func_available():
     )
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
@@ -248,6 +249,9 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
+    # One immutable snapshot per metadata build, shared by layers in this group.
+    prefill_cu_seq_lens: torch.Tensor | None = None
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -354,6 +358,51 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # Sliding window size to be used with the AOT scheduler will be
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
+        self._prefill_reuse_decoder_group: bool | None = None
+
+    def _build_prefill_cu_seq_lens(
+        self,
+        prefill_seq_lens: torch.Tensor | None,
+        common_prefix_len: int,
+        fast_build: bool,
+    ) -> torch.Tensor | None:
+        # Drafting can update lengths in place. Full mixed graphs would need
+        # persistent output addresses and an explicit update before replay.
+        if (
+            prefill_seq_lens is None
+            or self.dcp_world_size != 1
+            or common_prefix_len > 0
+            or fast_build
+            or self.vllm_config.speculative_config is not None
+            or self.compilation_config.cudagraph_mode.mixed_mode()
+            == CUDAGraphMode.FULL
+        ):
+            return None
+
+        # Layers may not exist when the builder is initialized. Resolve their
+        # types only once they are available; unknown groups keep the old path.
+        if self._prefill_reuse_decoder_group is None:
+            layers = get_layers_from_vllm_config(
+                self.vllm_config, Attention, self.layer_names
+            )
+            if not self.layer_names or len(layers) != len(self.layer_names):
+                return None
+            self._prefill_reuse_decoder_group = all(
+                layer.attn_type == AttentionType.DECODER for layer in layers.values()
+            )
+        if not self._prefill_reuse_decoder_group:
+            return None
+
+        # Use the authoritative device lengths, including any cached prefix.
+        # Own the result instead of sharing mutable scratch across steps/ubatches.
+        cu_seq_lens = torch.empty(
+            prefill_seq_lens.numel() + 1,
+            dtype=torch.int32,
+            device=prefill_seq_lens.device,
+        )
+        cu_seq_lens[:1].zero_()
+        torch.cumsum(prefill_seq_lens, dim=0, dtype=torch.int32, out=cu_seq_lens[1:])
+        return cu_seq_lens
 
     def build(
         self,
@@ -584,6 +633,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_max_seq_len=prefill_max_seq_len,
             prefill_seq_lens=prefill_seq_lens,
+            prefill_cu_seq_lens=self._build_prefill_cu_seq_lens(
+                prefill_seq_lens, common_prefix_len, fast_build
+            ),
             prefill_block_table=prefill_block_table_tensor,
             # \------------------------- Metax Modification -------------------------/
             block_table=block_table_tensor,
@@ -798,11 +850,13 @@ class FlashAttentionImpl(AttentionImpl):
                 # For handling prefill decode split
                 num_decode_tokens = attn_metadata.num_decode_tokens
                 if attn_metadata.num_prefills > 0:
-                    cu_prefix_kv_lens = torch.tensor(
-                        [0] + attn_metadata.prefill_seq_lens.tolist(),
-                        device=attn_metadata.prefill_seq_lens.device,
-                        dtype=torch.int32,
-                    ).cumsum(dim=0, dtype=torch.int32)
+                    cu_prefix_kv_lens = attn_metadata.prefill_cu_seq_lens
+                    if cu_prefix_kv_lens is None:
+                        cu_prefix_kv_lens = torch.tensor(
+                            [0] + attn_metadata.prefill_seq_lens.tolist(),
+                            device=attn_metadata.prefill_seq_lens.device,
+                            dtype=torch.int32,
+                        ).cumsum(dim=0, dtype=torch.int32)
                     output[num_decode_tokens:num_actual_tokens] = (
                         flash_attn_varlen_func(
                             q=query[num_decode_tokens:num_actual_tokens],
