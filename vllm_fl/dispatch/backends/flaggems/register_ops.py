@@ -39,6 +39,14 @@ def register_builtins(registry) -> None:
     is_avail = backend.is_available
 
     impls = [
+        OpImpl(
+            op_name="linear_swiglu",
+            impl_id="default.flagos",
+            kind=BackendImplKind.DEFAULT,
+            fn=_bind_is_available(backend.linear_swiglu, backend.linear_swiglu_is_available),
+            vendor=None,
+            priority=BackendPriority.DEFAULT,
+        ),
         # Quantization
         OpImpl(
             op_name="dynamic_per_token_quant_int8",

@@ -43,6 +43,20 @@ class FlagGemsBackend(Backend):
 
     # ==================== Operator Implementations ====================
 
+    def linear_swiglu_is_available(self) -> bool:
+        from vllm.platforms import current_platform
+
+        if getattr(current_platform, "vendor_name", None) != "metax" or not self.is_available():
+            return False
+        import flag_gems
+
+        return callable(getattr(flag_gems, "linear_swiglu", None))
+
+    def linear_swiglu(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        import flag_gems
+
+        return flag_gems.linear_swiglu(x, weight)
+
     def dynamic_per_token_quant_int8(
         self,
         x: torch.Tensor,

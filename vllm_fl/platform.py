@@ -249,6 +249,15 @@ class PlatformFL(Platform):
             )
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
+        # Optional semantic fusion: no model monkeypatch and no eager shape guard.
+        if (
+            isinstance(vllm_config.additional_config, dict)
+            and "linear_swiglu_fusion" in vllm_config.additional_config
+        ):
+            from vllm_fl.compilation.linear_swiglu import configure_linear_swiglu_fusion
+
+            configure_linear_swiglu_fusion(vllm_config, cls.vendor_name)
+
         # --------------------------------------------------------
         # maca specific config updates
         if cls.vendor_name == "metax":

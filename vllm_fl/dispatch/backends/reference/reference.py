@@ -44,6 +44,11 @@ class ReferenceBackend(Backend):
 
     # ==================== Operator Implementations ====================
 
+    def linear_swiglu(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        projection = torch.nn.functional.linear(x, weight).float()
+        gate, up = projection.chunk(2, dim=-1)
+        return (torch.nn.functional.silu(gate) * up).to(x.dtype)
+
     def dynamic_per_token_quant_int8(
         self,
         x: torch.Tensor,
