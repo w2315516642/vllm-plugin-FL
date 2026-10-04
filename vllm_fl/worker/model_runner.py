@@ -508,6 +508,7 @@ class ModelRunnerFL(
         )
 
         self.is_pooling_model = model_config.runner_type == "pooling"
+        self._prefill_tail = None
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
         self.is_multimodal_raw_input_only_model = (
             model_config.is_multimodal_raw_input_only_model
@@ -4375,6 +4376,28 @@ class ModelRunnerFL(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # Compact outputs are safe only when sampling is the sole hidden-state
+        # consumer. The original path retains full states for other consumers.
+        from vllm_fl.worker.prefill_tail import can_select_output_rows
+
+        select_prefill_rows = (
+            self._prefill_tail is not None
+            and not self.broadcast_pp_output
+            and input_ids is not None
+            and positions.ndim == 1
+            and can_select_output_rows(
+                num_tokens=num_tokens_unpadded,
+                output_rows=logits_indices,
+                cudagraph_mode=cudagraph_mode,
+                has_prompt_logprobs=bool(self.num_prompt_logprobs),
+                has_aux_hidden_states=self.use_aux_hidden_state_outputs,
+                has_intermediate_tensors=intermediate_tensors is not None,
+                has_inputs_embeds=inputs_embeds is not None,
+                has_model_kwargs=bool(model_kwargs),
+                should_ubatch=should_ubatch,
+            )
+        )
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4398,13 +4421,16 @@ class ModelRunnerFL(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            if select_prefill_rows:
+                model_output = self._prefill_tail(input_ids, positions, logits_indices)
+            else:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4432,7 +4458,9 @@ class ModelRunnerFL(
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = (
+                    hidden_states if select_prefill_rows else hidden_states[logits_indices]
+                )
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
@@ -5285,6 +5313,12 @@ class ModelRunnerFL(
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 
+                from vllm_fl.worker.prefill_tail import make_prefill_tail
+
+                self._prefill_tail = make_prefill_tail(self.model, self.vllm_config)
+                if self._prefill_tail is not None:
+                    logger.info("Enabled demand-driven final-layer prefill computation")
+
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
                 # actual MoE language model but don't implement
@@ -6047,6 +6081,17 @@ class ModelRunnerFL(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                # Warm/capture the independent prefill prefix with the same
+                # persistent inputs. Never add it to the original FULL decode
+                # graph. Runtime output-row counts are not prefix graph inputs.
+                if (
+                    self._prefill_tail is not None
+                    and cudagraph_runtime_mode != CUDAGraphMode.FULL
+                ):
+                    prefix_hidden, prefix_residual = self._prefill_tail.prefix(
+                        input_ids, positions
+                    )
+                    self._prefill_tail.warmup_tail(prefix_hidden, prefix_residual)
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
