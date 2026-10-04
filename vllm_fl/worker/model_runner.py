@@ -5313,6 +5313,16 @@ class ModelRunnerFL(
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 
+                from vllm_fl.quantization.w8a8.ffn import install_ffn_w8a8
+
+                quantized_ffns = install_ffn_w8a8(
+                    self.model,
+                    self.vllm_config,
+                    getattr(current_platform, "vendor_name", ""),
+                )
+                if quantized_ffns:
+                    logger.info("Enabled gate/up W8A8 for %d FFNs", quantized_ffns)
+
                 from vllm_fl.worker.prefill_tail import make_prefill_tail
 
                 self._prefill_tail = make_prefill_tail(self.model, self.vllm_config)
