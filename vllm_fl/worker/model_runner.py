@@ -575,7 +575,7 @@ class ModelRunnerFL(
             and is_oot_enabled()
             and use_flaggems_op("topk_topp_filter")
         ):
-            from vllm_fl.sampling.sampler import SamplerFL
+            from vllm_fl.sampling import SamplerFL
 
             sampler_type = SamplerFL
         self.sampler = sampler_type(
