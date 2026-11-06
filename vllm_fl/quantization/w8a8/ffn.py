@@ -1,10 +1,11 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 """Opt-in gate/up W8A8 with a paired RMSNorm/quantized-input boundary.
 
-Weights are quantized once after BF16 loading. The model's MLP, activation,
-down projection and global quantization configuration stay unchanged. The
-private QuantizedTokens edge is installed only where its sole consumer is the
-paired gate/up projection, including the demand-driven final-layer tail.
+Weights are quantized once after BF16 loading. The MLP topology, down projection
+and global quantization configuration stay unchanged. Optional interleaved
+storage replaces the paired activation together with its weight. The private
+QuantizedTokens edge has only the paired gate/up projection as its consumer,
+including the demand-driven final-layer tail.
 """
 
 from typing import NamedTuple
@@ -114,12 +115,42 @@ class QuantizedRMSNorm(nn.Module):
         return tokens if residual is None else (tokens, residual_out)
 
 
+@torch.no_grad()
+def interleave_gate_up(weight, scales):
+    """Pack K-contiguous [K,2*N] and [2*N] as g0,u0,g1,u1 once at load.
+
+    Return fresh storage; callers retain only the packed tensors. This does not
+    support changing a live model's layout or loading an already packed checkpoint.
+    """
+    if weight.ndim != 2 or weight.shape[1] % 2 or scales.shape != (weight.shape[1],):
+        raise ValueError("expected [K,2*N] weight and [2*N] channel scales")
+    if weight.device != scales.device:
+        raise ValueError("weight and scales must share a device")
+    n = weight.shape[1] // 2
+    packed = torch.stack((weight[:, :n].t(), weight[:, n:].t()), dim=1)
+    packed_scales = torch.stack((scales[:n], scales[n:]), dim=1)
+    packed_weight = packed.reshape(2 * n, weight.shape[0]).contiguous().t()
+    return packed_weight, packed_scales.flatten()
+
+
+class InterleavedSwiGLU(nn.Module):
+    """Activation paired only with a projection using interleaved channels."""
+
+    def forward(self, x):
+        from vllm_fl.ops.interleaved_swiglu import interleaved_swiglu
+
+        return interleaved_swiglu(x)
+
+
 class W8A8GateUp(nn.Module):
     """Bias-free, local gate/up projection; keeps the Linear tuple contract."""
 
-    def __init__(self, original):
+    def __init__(self, original, *, interleaved=False):
         super().__init__()
         weight, scales = quantize_channelwise_weight(original.weight)
+        self.interleaved = interleaved
+        if interleaved:
+            weight, scales = interleave_gate_up(weight, scales)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.register_buffer("weight_scale", scales)
         self.output_dtype = original.weight.dtype
@@ -142,11 +173,20 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     ``additional_config={"ffn_w8a8": True}`` is an experimental opt-in to this
     implementation, not vLLM's existing global quantization selection. No model
     name, layer number, batch size or MiniCPM-specific matrix shape is assumed.
+    The optional linear_swiglu_fusion pass can fuse this projection's INT8
+    operation with its activation. If it cannot match, this path stays unfused.
     """
     extra = config.additional_config
     enabled = extra.get("ffn_w8a8", False) if isinstance(extra, dict) else False
     if type(enabled) is not bool:
         raise ValueError("ffn_w8a8 must be a boolean")
+    interleaved = (
+        extra.get("ffn_w8a8_interleaved", False) if isinstance(extra, dict) else False
+    )
+    if type(interleaved) is not bool:
+        raise ValueError("ffn_w8a8_interleaved must be a boolean")
+    if interleaved and not enabled:
+        raise ValueError("ffn_w8a8_interleaved requires ffn_w8a8")
     if not enabled:
         return 0
 
@@ -158,6 +198,7 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     )
     from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP
 
+    from vllm_fl.ops.activation import SiluAndMulFL
     from vllm_fl.ops.layernorm import RMSNormFL
     from vllm_fl.utils import is_oot_enabled, use_flaggems_op
 
@@ -183,7 +224,6 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
         or config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
         or not is_oot_enabled()
         or not use_flaggems_op("rms_norm")
-        or extra.get("linear_swiglu_fusion", False)
     ):
         return 0
 
@@ -193,6 +233,12 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
             continue
         norm, projection = layer.post_attention_layernorm, layer.mlp.gate_up_proj
         if isinstance(norm, QuantizedRMSNorm) and isinstance(projection, W8A8GateUp):
+            if projection.interleaved != interleaved:
+                raise ValueError("cannot change gate/up layout after installation")
+            if interleaved and not isinstance(layer.mlp.act_fn, InterleavedSwiGLU):
+                raise ValueError(
+                    "interleaved projection requires its paired activation"
+                )
             continue
         if (
             type(norm) is not RMSNormFL
@@ -204,6 +250,9 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
             or projection.gather_output
             or not projection.return_bias
             or not isinstance(layer.mlp.act_fn, SiluAndMul)
+            or (
+                interleaved and type(layer.mlp.act_fn) not in (SiluAndMul, SiluAndMulFL)
+            )
             or projection.weight.dtype != torch.bfloat16
             or projection.weight.device.type != "cuda"
             or projection.weight.ndim != 2
@@ -221,10 +270,16 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     # Complete validation/conversion before mutating any module. A failed load
     # cannot leave half a norm/projection pair or a partially converted model.
     prepared = [
-        (layer, QuantizedRMSNorm(norm), W8A8GateUp(projection))
+        (
+            layer,
+            QuantizedRMSNorm(norm),
+            W8A8GateUp(projection, interleaved=interleaved),
+            InterleavedSwiGLU() if interleaved else layer.mlp.act_fn,
+        )
         for layer, norm, projection in pairs
     ]
-    for layer, norm, projection in prepared:
+    for layer, norm, projection, activation in prepared:
         layer.post_attention_layernorm = norm
         layer.mlp.gate_up_proj = projection
+        layer.mlp.act_fn = activation
     return len(prepared)

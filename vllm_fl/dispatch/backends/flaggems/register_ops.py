@@ -47,6 +47,37 @@ def register_builtins(registry) -> None:
             vendor=None,
             priority=BackendPriority.DEFAULT,
         ),
+        OpImpl(
+            op_name="scaled_int8_swiglu",
+            impl_id="default.flagos",
+            kind=BackendImplKind.DEFAULT,
+            fn=_bind_is_available(
+                backend.scaled_int8_swiglu, backend.scaled_int8_swiglu_is_available
+            ),
+            vendor=None,
+            priority=BackendPriority.DEFAULT,
+        ),
+        OpImpl(
+            op_name="interleaved_swiglu",
+            impl_id="default.flagos",
+            kind=BackendImplKind.DEFAULT,
+            fn=_bind_is_available(
+                backend.interleaved_swiglu, backend.interleaved_swiglu_is_available
+            ),
+            vendor=None,
+            priority=BackendPriority.DEFAULT,
+        ),
+        OpImpl(
+            op_name="scaled_int8_swiglu_interleaved",
+            impl_id="default.flagos",
+            kind=BackendImplKind.DEFAULT,
+            fn=_bind_is_available(
+                backend.scaled_int8_swiglu_interleaved,
+                backend.interleaved_swiglu_is_available,
+            ),
+            vendor=None,
+            priority=BackendPriority.DEFAULT,
+        ),
         # Quantization
         OpImpl(
             op_name="dynamic_per_token_quant_int8",

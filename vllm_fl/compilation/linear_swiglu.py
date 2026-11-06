@@ -1,9 +1,9 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
-"""Opt-in semantic fusion, without patching models or bypassing large-M graphs.
+"""Semantic fusion composed with the existing Inductor pass chain.
 
-Enable with additional_config={"linear_swiglu_fusion": {"max_tokens": 64}}.
-The token limit is an execution policy, not an operator shape restriction.
-Other compile ranges retain the original linear and activation graph.
+``max_tokens`` limits the separate BF16 fusion option. INT8 fusion uses an
+independent lower bound: 1 for interleaved weights and 129 for segmented weights.
+No model name, layer number or exact M is used to recognize the graph.
 """
 
 import functools
@@ -77,10 +77,15 @@ def _matcher():
 class LinearSwiGLUPass(InductorPass):
     """Compose with an existing pass and fuse only selected compile ranges."""
 
-    def __init__(self, max_tokens: int, previous=None):
+    def __init__(
+        self, max_tokens: int, previous=None, *, enable_int8=False, int8_min_tokens=129
+    ):
         self.max_tokens = max_tokens
         self.previous = previous
+        self.enable_int8 = enable_int8
+        self.int8_min_tokens = int8_min_tokens
         self.matched_count = 0
+        self.int8_matched_count = 0
 
     def __call__(self, graph):
         compile_range = get_pass_context().compile_range
@@ -89,34 +94,52 @@ class LinearSwiGLUPass(InductorPass):
         ):
             self.previous(graph)
         self.matched_count = 0
-        if compile_range.start < 1 or compile_range.end > self.max_tokens:
+        self.int8_matched_count = 0
+        if compile_range.start < 1:
             return
-        self.matched_count = _matcher().apply(graph)
+        # An INT8 profile must not opportunistically replace a BF16 graph when
+        # its model failed quantization eligibility checks.
+        if not self.enable_int8 and compile_range.end <= self.max_tokens:
+            self.matched_count = _matcher().apply(graph)
+        if self.enable_int8 and compile_range.start >= self.int8_min_tokens:
+            from vllm_fl.compilation.scaled_int8_swiglu import matcher
+
+            self.int8_matched_count = matcher(self.int8_min_tokens).apply(graph)
+            self.matched_count += self.int8_matched_count
         if self.matched_count:
             logger.debug(
-                "Fused %d linear/SwiGLU patterns in range %s",
+                "Fused %d linear/SwiGLU patterns (%d INT8) in range %s",
                 self.matched_count,
+                self.int8_matched_count,
                 compile_range,
             )
 
     def uuid(self):
+        int8_source = None
+        if self.enable_int8:
+            from vllm_fl.compilation.scaled_int8_swiglu import source_uuid
+
+            int8_source = source_uuid(type(self))
         return self.hash_dict(
             {
                 "source": self.hash_source(
                     type(self), _pattern, _replacement, _supported, _matcher.__wrapped__
                 ),
                 "max_tokens": self.max_tokens,
+                "int8_source": int8_source,
+                "enable_int8": self.enable_int8,
+                "int8_min_tokens": self.int8_min_tokens,
                 "previous": self.previous.uuid() if self.previous is not None else None,
             }
         )
 
 
 def configure_linear_swiglu_fusion(config, vendor_name):
-    """Keep this unproven performance option off unless explicitly requested.
+    """Install the semantic pass when requested by platform/model configuration.
 
-    Shape support is independent of MiniCPM or any model class. Only the
-    validated MetaX BF16 inference stack is enabled here; unsupported backends
-    and configurations retain their existing graph and dispatch policy.
+    Shape support is independent of MiniCPM or any model class. The BF16
+    inference stack remains MetaX-only. The optional INT8 matcher also requires
+    the W8A8 opt-in and a compatible FlagGems operator; other graphs stay intact.
     """
     from vllm.config import CompilationMode
 
@@ -155,20 +178,37 @@ def configure_linear_swiglu_fusion(config, vendor_name):
         logger.info("Linear/SwiGLU fusion left disabled for this configuration")
         return False
     previous = cc.inductor_compile_config.get(_PASS_KEY)
+    enable_int8 = (
+        extra.get("ffn_w8a8") is True
+        and use_flaggems_op("scaled_int8_swiglu")
+        and FlagGemsBackend().scaled_int8_swiglu_is_available()
+    )
+    int8_min_tokens = 1 if extra.get("ffn_w8a8_interleaved") is True else 129
     if isinstance(previous, LinearSwiGLUPass):
-        if previous.max_tokens != max_tokens:
+        if (
+            previous.max_tokens != max_tokens
+            or previous.enable_int8 != enable_int8
+            or previous.int8_min_tokens != int8_min_tokens
+        ):
             raise ValueError(
-                "linear_swiglu_fusion configured twice with different limits"
+                "linear_swiglu_fusion configured twice with different policies"
             )
         return True
     if previous is not None and not isinstance(previous, InductorPass):
         raise ValueError("Existing post-grad pass must be an InductorPass")
-    cc.inductor_compile_config[_PASS_KEY] = LinearSwiGLUPass(max_tokens, previous)
-    # Preserve user/other-pass endpoints. vLLM adds the scheduler's upper bound.
-    cc.compile_ranges_endpoints = sorted(
-        set([*(cc.compile_ranges_endpoints or []), max_tokens])
+    fusion_pass = LinearSwiGLUPass(
+        max_tokens, previous, enable_int8=enable_int8, int8_min_tokens=int8_min_tokens
     )
+    cc.inductor_compile_config[_PASS_KEY] = fusion_pass
+    # Preserve user/other-pass endpoints. vLLM adds the scheduler's upper bound.
+    endpoints = {*(cc.compile_ranges_endpoints or []), max_tokens}
+    if enable_int8 and fusion_pass.int8_min_tokens > 1:
+        endpoints.add(fusion_pass.int8_min_tokens - 1)
+    cc.compile_ranges_endpoints = sorted(endpoints)
     logger.info(
-        "Enabled linear/SwiGLU graph fusion for token ranges up to %d", max_tokens
+        "Enabled linear/SwiGLU fusion: BF16 tokens <= %d; INT8=%s, tokens >= %d",
+        max_tokens,
+        enable_int8,
+        fusion_pass.int8_min_tokens,
     )
     return True

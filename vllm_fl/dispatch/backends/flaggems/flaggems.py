@@ -57,6 +57,43 @@ class FlagGemsBackend(Backend):
 
         return flag_gems.linear_swiglu(x, weight)
 
+    def scaled_int8_swiglu_is_available(self) -> bool:
+        from vllm.platforms import current_platform
+
+        if (
+            getattr(current_platform, "vendor_name", None) != "metax"
+            or not self.is_available()
+        ):
+            return False
+        import flag_gems
+
+        return callable(getattr(flag_gems, "scaled_int8_swiglu", None))
+
+    def scaled_int8_swiglu(self, x, weight, scale_x, scale_w):
+        import flag_gems
+
+        return flag_gems.scaled_int8_swiglu(x, weight, scale_x, scale_w)
+
+    def interleaved_swiglu_is_available(self):
+        if not self.scaled_int8_swiglu_is_available():
+            return False
+        import flag_gems
+
+        return all(
+            callable(getattr(flag_gems, name, None))
+            for name in ("interleaved_swiglu", "scaled_int8_swiglu_interleaved")
+        )
+
+    def interleaved_swiglu(self, x):
+        import flag_gems
+
+        return flag_gems.interleaved_swiglu(x)
+
+    def scaled_int8_swiglu_interleaved(self, x, weight, scale_x, scale_w):
+        import flag_gems
+
+        return flag_gems.scaled_int8_swiglu_interleaved(x, weight, scale_x, scale_w)
+
     def dynamic_per_token_quant_int8(
         self,
         x: torch.Tensor,
