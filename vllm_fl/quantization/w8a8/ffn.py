@@ -145,9 +145,10 @@ class InterleavedSwiGLU(nn.Module):
 class W8A8GateUp(nn.Module):
     """Bias-free, local gate/up projection; keeps the Linear tuple contract."""
 
-    def __init__(self, original, *, interleaved=False):
+    def __init__(self, original, *, interleaved=False, dynamic_input=False):
         super().__init__()
         weight, scales = quantize_channelwise_weight(original.weight)
+        self.dynamic_input = dynamic_input
         self.interleaved = interleaved
         if interleaved:
             weight, scales = interleave_gate_up(weight, scales)
@@ -156,6 +157,14 @@ class W8A8GateUp(nn.Module):
         self.output_dtype = original.weight.dtype
 
     def forward(self, x):
+        if self.dynamic_input:
+            from .projections import dynamic_int8_linear
+
+            if x.shape[0] == 0:
+                return x.new_empty((0, self.weight.shape[1])), None
+            return dynamic_int8_linear(
+                x.contiguous(), self.weight, self.weight_scale, "gate"
+            ), None
         # Independent MLP callers can still provide ordinary floating activations.
         # The paired decoder path provides QuantizedTokens without re-quantizing.
         if isinstance(x, QuantizedTokens):
@@ -170,7 +179,7 @@ class W8A8GateUp(nn.Module):
 def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     """Return installed pair count; unsupported configurations stay unchanged.
 
-    ``additional_config={"ffn_w8a8": True}`` is an experimental opt-in to this
+    ``additional_config={"ffn_w8a8": True}`` is an explicit opt-in to this
     implementation, not vLLM's existing global quantization selection. No model
     name, layer number, batch size or MiniCPM-specific matrix shape is assumed.
     The optional linear_swiglu_fusion pass can fuse this projection's INT8
@@ -187,6 +196,8 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
         raise ValueError("ffn_w8a8_interleaved must be a boolean")
     if interleaved and not enabled:
         raise ValueError("ffn_w8a8_interleaved requires ffn_w8a8")
+    if interleaved and vendor_name != "metax":
+        raise ValueError("interleaved gate/up is supported only on MetaX")
     if not enabled:
         return 0
 
@@ -204,7 +215,7 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
 
     mc, pc = config.model_config, config.parallel_config
     if (
-        vendor_name != "metax"
+        vendor_name not in ("metax", "iluvatar")
         or mc.dtype != torch.bfloat16
         or mc.runner_type != "generate"
         or mc.is_encoder_decoder
@@ -232,7 +243,7 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
         if type(layer) is not LlamaDecoderLayer or type(layer.mlp) is not LlamaMLP:
             continue
         norm, projection = layer.post_attention_layernorm, layer.mlp.gate_up_proj
-        if isinstance(norm, QuantizedRMSNorm) and isinstance(projection, W8A8GateUp):
+        if isinstance(projection, W8A8GateUp):
             if projection.interleaved != interleaved:
                 raise ValueError("cannot change gate/up layout after installation")
             if interleaved and not isinstance(layer.mlp.act_fn, InterleavedSwiGLU):
@@ -272,8 +283,12 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     prepared = [
         (
             layer,
-            QuantizedRMSNorm(norm),
-            W8A8GateUp(projection, interleaved=interleaved),
+            QuantizedRMSNorm(norm) if vendor_name == "metax" else norm,
+            W8A8GateUp(
+                projection,
+                interleaved=interleaved,
+                dynamic_input=vendor_name == "iluvatar",
+            ),
             InterleavedSwiGLU() if interleaved else layer.mlp.act_fn,
         )
         for layer, norm, projection in pairs
