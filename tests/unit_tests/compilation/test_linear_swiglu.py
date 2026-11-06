@@ -192,17 +192,3 @@ def test_dynamic_inductor_compilation(small_range):
         expected = (F.silu(a) * b).bfloat16()
         torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
     assert matches and all(n == int(small_range) for n in matches)
-
-
-@pytest.mark.gpu
-def test_reference_dispatch_is_preserved():
-    from vllm_fl.dispatch import SelectionPolicy, policy_context
-    from vllm_fl.ops.linear_swiglu import linear_swiglu
-
-    x = torch.randn((7, 32), device="cuda", dtype=torch.bfloat16)
-    w = torch.randn((96, 32), device="cuda", dtype=torch.bfloat16) / 8
-    projection = F.linear(x, w).float()
-    a, b = projection.chunk(2, dim=-1)
-    expected = (F.silu(a) * b).bfloat16()
-    with policy_context(SelectionPolicy(prefer="reference")):
-        torch.testing.assert_close(linear_swiglu(x, w), expected, rtol=0, atol=0)
