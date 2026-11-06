@@ -1256,7 +1256,7 @@ class ModelRunnerFL(
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             if req_id in self.requests:
-                # For streaming case only.
+                # Streaming updates and V2 preemption resumes share this path.
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 reqs_to_add.append(req_state)
                 continue
@@ -1616,13 +1616,14 @@ class ModelRunnerFL(
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
     ) -> CachedRequestState:
-        """Updates streaming session request from `scheduled_new_reqs`.
+        """Update a cached request received through `scheduled_new_reqs`.
 
         Removes the request from InputBatch (if present), updates the cached
         state, and prepares it for re-addition to the batch.
 
-        NOTE: prompt_token_ids includes intermediate output tokens - tokens
-        previously generated but now are input context (part of the prompt).
+        Streaming updates fold prior output into prompt_token_ids. V2
+        preemption resumes keep the original prompt and carry the full
+        recomputation context in prefill_token_ids instead.
         """
         self.input_batch.remove_request(req_id)
         req_state = self.requests[req_id]
@@ -1639,9 +1640,18 @@ class ModelRunnerFL(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
 
-        # Clear `output_token_ids` as previous output tokens are now part of
-        # `prompt_token_ids`.
-        req_state.output_token_ids.clear()
+        # V1 streaming folds prior output into prompt_token_ids. V2 also sends
+        # preemption resumes through scheduled_new_reqs, but carries their
+        # generated history separately in prefill_token_ids. Preserve that
+        # history so input reconstruction and sampling use the same frontier
+        # as the scheduler. Retain the existing generator and cached state.
+        prefill_token_ids = getattr(new_req_data, "prefill_token_ids", None)
+        if prefill_token_ids is None:
+            req_state.output_token_ids.clear()
+        else:
+            req_state.output_token_ids[:] = prefill_token_ids[
+                req_state.num_prompt_tokens :
+            ]
 
         if self.uses_mrope:
             self._init_mrope_positions(req_state)

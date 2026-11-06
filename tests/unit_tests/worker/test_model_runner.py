@@ -11,6 +11,7 @@ This module follows a layered testing strategy:
 Note: These tests require vllm >= 0.13.0 with full installation.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -36,6 +37,130 @@ def has_vllm_model_runner():
 pytestmark = pytest.mark.skipif(
     not has_vllm_model_runner(), reason="vllm_fl.worker.model_runner not available"
 )
+
+
+class TestRequestHistoryRecovery:
+    """Exercise cached-request recovery without allocating GPU state."""
+
+    @staticmethod
+    def make_runner():
+        from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+        from vllm_fl.worker.model_runner import ModelRunnerFL
+
+        runner = ModelRunnerFL.__new__(ModelRunnerFL)
+        runner.input_batch = MagicMock()
+        runner.late_interaction_runner = MagicMock()
+        runner.uses_mrope = False
+        runner.requests = {
+            "r": CachedRequestState(
+                req_id="r",
+                prompt_token_ids=[1] * 16,
+                mm_features=[],
+                sampling_params=None,
+                generator=torch.Generator(),
+                block_ids=([1],),
+                num_computed_tokens=0,
+                output_token_ids=[-1, -1],
+            )
+        }
+        return runner
+
+    @staticmethod
+    def make_data(prompt, history, *, v2=True, embeds=None):
+        from vllm.v1.core.sched.output import NewRequestData
+
+        request = SimpleNamespace(
+            request_id="r",
+            prompt_token_ids=prompt,
+            prompt_embeds=embeds,
+            prompt_is_token_ids=None,
+            mm_features=[],
+            sampling_params=None,
+            pooling_params=None,
+            num_computed_tokens=256,
+            lora_request=None,
+        )
+        context = list(prompt) if prompt is not None else [0] * len(embeds)
+        return NewRequestData.from_request(
+            request, ([2, 3],), context + history if v2 else None
+        )
+
+    @pytest.mark.parametrize("history_size", [0, 1, 24, 55])
+    def test_v2_resume_restores_authoritative_history(self, history_size):
+        runner = self.make_runner()
+        state = runner.requests["r"]
+        generator = state.generator
+        outputs = state.output_token_ids
+        prompt = [1] * 16384
+        history = list(range(7000, 7000 + history_size))
+        data = self.make_data(prompt, history)
+
+        restored = runner._update_streaming_request("r", data)
+
+        assert restored is state
+        assert restored.generator is generator
+        assert restored.output_token_ids is outputs
+        assert restored.output_token_ids == history
+        assert restored.num_tokens == len(prompt) + len(history)
+        assert restored.num_computed_tokens == data.num_computed_tokens
+        assert restored.block_ids == data.block_ids
+        assert [
+            restored.get_token_id(len(prompt) + i) for i in range(history_size)
+        ] == history
+        runner.input_batch.remove_request.assert_called_once_with("r")
+
+    @pytest.mark.parametrize("schema", ["legacy", "v1", "v2"])
+    def test_streaming_keeps_prior_output_in_new_prompt(self, schema):
+        runner = self.make_runner()
+        prompt = [1] * 16 + [7000, 7001] + [2] * 8
+        data = self.make_data(prompt, [], v2=schema == "v2")
+        if schema == "legacy":
+            data = SimpleNamespace(
+                **{k: v for k, v in vars(data).items() if k != "prefill_token_ids"}
+            )
+
+        state = runner._update_streaming_request("r", data)
+
+        assert state.prompt_token_ids == prompt
+        assert state.output_token_ids == []
+        assert state.num_tokens == len(prompt)
+
+    def test_embedding_prompt_uses_embedding_length(self):
+        runner = self.make_runner()
+        embeds = torch.zeros(7, 4)
+        history = list(range(7000, 7024))
+        data = self.make_data(None, history, embeds=embeds)
+
+        state = runner._update_streaming_request("r", data)
+
+        assert state.prompt_embeds is embeds
+        assert state.num_prompt_tokens == 7
+        assert state.output_token_ids == history
+        assert state.num_tokens == 31
+
+    def test_repeated_resume_replaces_stale_history(self):
+        runner = self.make_runner()
+        prompt = [1] * 16
+        runner._update_streaming_request("r", self.make_data(prompt, [7000]))
+        history = [7000, 7001, 7002]
+
+        state = runner._update_streaming_request("r", self.make_data(prompt, history))
+
+        assert state.output_token_ids == history
+        assert state.num_tokens == len(prompt) + len(history)
+
+    def test_recompute_at_prompt_end_still_needs_history(self):
+        runner = self.make_runner()
+        prompt = [1] * 16384
+        history = list(range(7000, 7024))
+
+        state = runner._update_streaming_request("r", self.make_data(prompt, history))
+
+        # At the original failure boundary, sampling must remain discarded:
+        # the scheduler has not yet recomputed the 24 generated context tokens.
+        assert len(prompt) < state.num_tokens
+        assert state.num_tokens == 16408
 
 
 # =============================================================================
