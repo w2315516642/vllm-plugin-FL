@@ -5346,7 +5346,7 @@ class ModelRunnerFL(
                 if quantized_ffns:
                     logger.info("Enabled gate/up W8A8 for %d FFNs", quantized_ffns)
 
-                from vllm_fl.quantization.w8a8.down import install_ffn_down_w8a8
+                from vllm_fl.quantization.w8a8.projections import install_ffn_down_w8a8
 
                 quantized_downs = install_ffn_down_w8a8(
                     self.model,
@@ -5356,7 +5356,7 @@ class ModelRunnerFL(
                 if quantized_downs:
                     logger.info("Enabled down W8A8 for %d FFNs", quantized_downs)
 
-                from vllm_fl.quantization.w8a8.o_projection import install_attention_o_w8a8
+                from vllm_fl.quantization.w8a8.projections import install_attention_o_w8a8
 
                 quantized_o = install_attention_o_w8a8(
                     self.model,
@@ -5366,7 +5366,7 @@ class ModelRunnerFL(
                 if quantized_o:
                     logger.info("Enabled O projection W8A8 for %d attention layers", quantized_o)
 
-                from vllm_fl.quantization.w8a8.qkv import install_qkv_w8a8
+                from vllm_fl.quantization.w8a8.projections import install_qkv_w8a8
 
                 quantized_qkv = install_qkv_w8a8(
                     self.model, self.vllm_config,
