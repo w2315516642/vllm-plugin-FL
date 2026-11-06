@@ -137,7 +137,7 @@ class InterleavedSwiGLU(nn.Module):
     """Activation paired only with a projection using interleaved channels."""
 
     def forward(self, x):
-        from vllm_fl.ops.interleaved_swiglu import interleaved_swiglu
+        from vllm_fl.ops.linear_swiglu import interleaved_swiglu
 
         return interleaved_swiglu(x)
 

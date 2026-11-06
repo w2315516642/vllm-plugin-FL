@@ -9,11 +9,11 @@ from torch._inductor import pattern_matcher as pm
 
 from vllm.compilation.passes.inductor_pass import enable_fake_mode
 
-from vllm_fl.ops.interleaved_swiglu import (
+from vllm_fl.ops.linear_swiglu import (
     interleaved_swiglu,
+    scaled_int8_swiglu,
     scaled_int8_swiglu_interleaved,
 )
-from vllm_fl.ops.scaled_int8_swiglu import scaled_int8_swiglu
 from vllm_fl.quantization.w8a8.ffn import _scaled_mm
 
 
