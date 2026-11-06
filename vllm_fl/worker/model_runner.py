@@ -5376,7 +5376,7 @@ class ModelRunnerFL(
                     logger.info("Enabled paired RMSNorm/QKV W8A8 for %d layers", quantized_qkv)
 
                 from vllm_fl.optimizations.config import feature_enabled
-                from vllm_fl.optimizations.install import install_model_optimizations
+                from vllm_fl.optimizations.model import install_model_optimizations
 
                 optimized = install_model_optimizations(
                     self.model, self.vllm_config,
