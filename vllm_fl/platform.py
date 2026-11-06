@@ -174,6 +174,9 @@ class PlatformFL(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        from vllm_fl.optimizations.config import prepare_optimizations
+
+        prepare_optimizations(vllm_config, cls.vendor_name)
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 

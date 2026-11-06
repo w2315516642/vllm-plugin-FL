@@ -565,7 +565,20 @@ class ModelRunnerFL(
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
-        self.sampler = Sampler(
+        from vllm_fl.optimizations.config import feature_enabled
+        from vllm_fl.utils import is_oot_enabled, use_flaggems_op
+
+        sampler_type = Sampler
+        if (
+            getattr(current_platform, "vendor_name", "") in ("metax", "iluvatar")
+            and feature_enabled(self.vllm_config, "tiled_sampling")
+            and is_oot_enabled()
+            and use_flaggems_op("topk_topp_filter")
+        ):
+            from vllm_fl.sampling.sampler import SamplerFL
+
+            sampler_type = SamplerFL
+        self.sampler = sampler_type(
             logprobs_mode=self.model_config.logprobs_mode,
             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
         )
@@ -5333,9 +5346,51 @@ class ModelRunnerFL(
                 if quantized_ffns:
                     logger.info("Enabled gate/up W8A8 for %d FFNs", quantized_ffns)
 
+                from vllm_fl.quantization.w8a8.down import install_ffn_down_w8a8
+
+                quantized_downs = install_ffn_down_w8a8(
+                    self.model,
+                    self.vllm_config,
+                    getattr(current_platform, "vendor_name", ""),
+                )
+                if quantized_downs:
+                    logger.info("Enabled down W8A8 for %d FFNs", quantized_downs)
+
+                from vllm_fl.quantization.w8a8.o_projection import install_attention_o_w8a8
+
+                quantized_o = install_attention_o_w8a8(
+                    self.model,
+                    self.vllm_config,
+                    getattr(current_platform, "vendor_name", ""),
+                )
+                if quantized_o:
+                    logger.info("Enabled O projection W8A8 for %d attention layers", quantized_o)
+
+                from vllm_fl.quantization.w8a8.qkv import install_qkv_w8a8
+
+                quantized_qkv = install_qkv_w8a8(
+                    self.model, self.vllm_config,
+                    getattr(current_platform, "vendor_name", ""),
+                )
+                if quantized_qkv:
+                    logger.info("Enabled paired RMSNorm/QKV W8A8 for %d layers", quantized_qkv)
+
+                from vllm_fl.optimizations.config import feature_enabled
+                from vllm_fl.optimizations.install import install_model_optimizations
+
+                optimized = install_model_optimizations(
+                    self.model, self.vllm_config,
+                    getattr(current_platform, "vendor_name", ""),
+                )
+                if any(optimized.values()):
+                    logger.info("Installed model-local optimizations: %s", optimized)
+
                 from vllm_fl.worker.prefill_tail import make_prefill_tail
 
-                self._prefill_tail = make_prefill_tail(self.model, self.vllm_config)
+                self._prefill_tail = (
+                    make_prefill_tail(self.model, self.vllm_config)
+                    if feature_enabled(self.vllm_config, "prefill_tail") else None
+                )
                 if self._prefill_tail is not None:
                     logger.info("Enabled demand-driven final-layer prefill computation")
 
