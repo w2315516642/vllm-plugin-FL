@@ -20,7 +20,6 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.triton_attn import (
     AttentionType,
     KVQuantMode,
-    TritonAttentionImpl,
 )
 
 from vllm_fl.attention.iluvatar.impl import TunedTritonAttentionImpl
@@ -312,6 +311,10 @@ def test_unsupported_configuration_is_unchanged(kind):
 
 @pytest.mark.parametrize("m,n,k", [(33, 35, 67)])
 @pytest.mark.gpu
+@pytest.mark.skipif(
+    getattr(current_platform, "vendor_name", None) != "metax",
+    reason="the linear/SwiGLU framework boundary is registered only for MetaX",
+)
 def test_match_has_no_model_or_exact_m_signature(m, n, k):
     torch.manual_seed(31)
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
@@ -690,12 +693,13 @@ def test_unsupported_configuration_keeps_model(field):
     reason="Iluvatar kernel",
 )
 @pytest.mark.parametrize("query_lengths", [(1, 1), (3, 5)])
+@pytest.mark.parametrize("heads,kv_heads", [(16, 2), (32, 4)])
 @torch.inference_mode()
-def test_tuned_attention_matches_original(query_lengths):
+def test_tuned_attention_matches_cpu_reference(query_lengths, heads, kv_heads):
     torch.manual_seed(7302)
     tokens = sum(query_lengths)
-    q = torch.randn(tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
-    cache = torch.randn(12, 2, 16, 4, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(tokens, heads, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(12, 2, 16, kv_heads, 128, device="cuda", dtype=torch.bfloat16)
     state = SimpleNamespace(
         attn_type=AttentionType.DECODER,
         _is_per_token_head_quant=False,
@@ -732,19 +736,36 @@ def test_tuned_attention_matches_original(query_lengths):
         ),
         seq_threshold_3D=64,
         num_par_softmax_segments=16,
-        softmax_segm_output=torch.empty(64, 32, 16, 128, device="cuda"),
-        softmax_segm_max=torch.empty(64, 32, 16, device="cuda"),
-        softmax_segm_expsum=torch.empty(64, 32, 16, device="cuda"),
+        softmax_segm_output=torch.empty(64, heads, 16, 128, device="cuda"),
+        softmax_segm_max=torch.empty(64, heads, 16, device="cuda"),
+        softmax_segm_expsum=torch.empty(64, heads, 16, device="cuda"),
         mm_prefix_range_tensor=None,
         causal=True,
     )
-    reference = torch.empty_like(q)
     actual = torch.empty_like(q)
     # forward reads the paged cache; cache writes belong to the unchanged
     # do_kv_cache_update entry and are not performed by either call here.
-    TritonAttentionImpl.forward(state, layer, q, q, q, cache, metadata, reference)
     TunedTritonAttentionImpl.forward(state, layer, q, q, q, cache, metadata, actual)
-    torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.02)
+    # An independent FP32 CPU reference also covers upstream/runtime errors;
+    # comparing only two device implementations can accept the same defect.
+    query, pages = q.cpu().float(), cache.cpu().float()
+    references, offset = [], 0
+    for i, (qlen, klen) in enumerate(zip(query_lengths, [64, 97])):
+        blocks = metadata.block_table[i, : (klen + 15) // 16].cpu().long()
+        k = pages[blocks, 0].reshape(-1, kv_heads, 128)[:klen]
+        v = pages[blocks, 1].reshape(-1, kv_heads, 128)[:klen]
+        k, v = (x.repeat_interleave(heads // kv_heads, dim=1) for x in (k, v))
+        scores = torch.einsum("qhd,khd->qhk", query[offset : offset + qlen], k)
+        scores *= 128**-0.5
+        mask = (
+            torch.arange(klen)[None, None, :]
+            > torch.arange(klen - qlen, klen)[:, None, None]
+        )
+        scores.masked_fill_(mask, -torch.inf)
+        references.append(torch.einsum("qhk,khd->qhd", scores.softmax(-1), v))
+        offset += qlen
+    reference = torch.cat(references).to(actual.dtype)
+    torch.testing.assert_close(actual.cpu(), reference, rtol=0.02, atol=0.02)
 
 
 @pytest.fixture
