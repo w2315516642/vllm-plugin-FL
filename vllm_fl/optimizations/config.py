@@ -21,8 +21,10 @@ _PRESETS = {
         "qkv_w8a8": True,
         "tiled_sampling": True,
         "prefill_tail": True,
+        "ffn_gate_norm_quant": True,
         "bf16_linear_tuning": True,
         "triton_attention_tuning": True,
+        "quest_attention": True,
     },
 }
 
@@ -52,6 +54,10 @@ def prepare_optimizations(config, vendor):
         # Explicitly conflicting settings remain visible to installer validation.
         defaults["ffn_w8a8_interleaved"] = False
         defaults["linear_swiglu_fusion"] = False
+        defaults["ffn_gate_norm_quant"] = False
+    if settings.get("qkv_w8a8") is False:
+        # This pass requires the following opaque residual consumer.
+        defaults["ffn_gate_norm_quant"] = False
     for name, value in defaults.items():
         settings.setdefault(name, value)
     config.additional_config = settings

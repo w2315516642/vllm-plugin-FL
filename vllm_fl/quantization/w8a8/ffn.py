@@ -142,6 +142,113 @@ class InterleavedSwiGLU(nn.Module):
         return interleaved_swiglu(x)
 
 
+class PaddedGateTokens(NamedTuple):
+    values: torch.Tensor
+    scales: torch.Tensor
+    shape_source: torch.Tensor
+
+
+@torch.library.custom_op("vllm_fl::gate_norm_quant", mutates_args=())
+def gate_norm_quant(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from flag_gems import add_rms_norm_quantize_int8
+
+    m = x.shape[0]
+    multiple = 32 if m <= 32 else 128
+    rows = ((m + multiple - 1) // multiple) * multiple
+    return add_rms_norm_quantize_int8(x, residual, weight, eps, padded_rows=rows)
+
+
+@gate_norm_quant.register_fake
+def _gate_norm_fake(x, residual, weight, eps):
+    m = x.shape[0]
+    rows = torch.sym_ite(m <= 32, ((m + 31) // 32) * 32, ((m + 127) // 128) * 128)
+    return (
+        x.new_empty((rows, x.shape[1]), dtype=torch.int8),
+        x.new_empty((rows, 1), dtype=torch.float32),
+        torch.empty_like(x),
+    )
+
+
+@torch.library.custom_op("vllm_fl::gate_from_padded_int8", mutates_args=())
+def gate_from_padded_int8(
+    source: torch.Tensor,
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    from flag_gems import scaled_int8_linear
+
+    m = source.shape[0]
+    if not m:
+        return source.new_empty((0, weight.shape[1]))
+    return scaled_int8_linear(q, weight, scale, weight_scale, kind="gate")[:m]
+
+
+@gate_from_padded_int8.register_fake
+def _gate_from_padded_fake(source, q, scale, weight, weight_scale):
+    return source.new_empty((source.shape[0], weight.shape[1]))
+
+
+class GateQuantizedRMSNorm(nn.Module):
+    """Only for a paired gate followed by an opaque input-dtype residual consumer."""
+
+    def __init__(self, original):
+        super().__init__()
+        self.weight = original.weight
+        self.variance_epsilon = original.variance_epsilon
+        self.variance_size_override = None
+        self.has_weight = True
+
+    def forward(self, x, residual=None):
+        if residual is None:
+            from vllm_fl.dispatch import CachedOp
+
+            return CachedOp("rms_norm")(self, x, None)
+        q, scale, residual_out = gate_norm_quant(
+            x, residual, self.weight, self.variance_epsilon
+        )
+        return PaddedGateTokens(q, scale, x), residual_out
+
+
+def install_gate_norm_quant(model, config, vendor):
+    """Fuse only edges whose next opaque norm already materializes BF16 residual."""
+    extra = config.additional_config
+    enabled = (
+        extra.get("ffn_gate_norm_quant", False) if isinstance(extra, dict) else False
+    )
+    if type(enabled) is not bool:
+        raise ValueError("ffn_gate_norm_quant must be a boolean")
+    if not enabled or vendor != "iluvatar":
+        return 0
+    from vllm.model_executor.models.llama import LlamaDecoderLayer
+
+    from vllm_fl.ops.layernorm import RMSNormFL
+
+    count = 0
+    for parent in model.modules():
+        layers = getattr(parent, "layers", None)
+        if type(layers) is not nn.ModuleList:
+            continue
+        for layer, following in zip(layers, layers[1:]):
+            if (
+                type(layer) is not LlamaDecoderLayer
+                or type(following) is not LlamaDecoderLayer
+                or type(following.input_layernorm) is not QuantizedRMSNorm
+                or type(layer.post_attention_layernorm) is not RMSNormFL
+                or type(layer.mlp.gate_up_proj) is not W8A8GateUp
+                or not layer.mlp.gate_up_proj.dynamic_input
+            ):
+                continue
+            layer.post_attention_layernorm = GateQuantizedRMSNorm(
+                layer.post_attention_layernorm
+            )
+            count += 1
+    return count
+
+
 class W8A8GateUp(nn.Module):
     """Bias-free, local gate/up projection; keeps the Linear tuple contract."""
 
@@ -158,22 +265,37 @@ class W8A8GateUp(nn.Module):
 
     def forward(self, x):
         if self.dynamic_input:
+            if isinstance(x, PaddedGateTokens):
+                return (
+                    gate_from_padded_int8(
+                        x.shape_source,
+                        x.values,
+                        x.scales,
+                        self.weight,
+                        self.weight_scale,
+                    ),
+                    None,
+                )
             from .projections import dynamic_int8_linear
 
             if x.shape[0] == 0:
                 return x.new_empty((0, self.weight.shape[1])), None
-            return dynamic_int8_linear(
-                x.contiguous(), self.weight, self.weight_scale, "gate"
-            ), None
+            return (
+                dynamic_int8_linear(
+                    x.contiguous(), self.weight, self.weight_scale, "gate"
+                ),
+                None,
+            )
         # Independent MLP callers can still provide ordinary floating activations.
         # The paired decoder path provides QuantizedTokens without re-quantizing.
         if isinstance(x, QuantizedTokens):
             q, scales = x
         else:
             q, scales = _quant(x)
-        return _scaled_mm(
-            q, self.weight, scales, self.weight_scale, self.output_dtype
-        ), None
+        return (
+            _scaled_mm(q, self.weight, scales, self.weight_scale, self.output_dtype),
+            None,
+        )
 
 
 def install_ffn_w8a8(model, config, vendor_name: str) -> int:
@@ -189,6 +311,13 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     enabled = extra.get("ffn_w8a8", False) if isinstance(extra, dict) else False
     if type(enabled) is not bool:
         raise ValueError("ffn_w8a8 must be a boolean")
+    norm_fusion = (
+        extra.get("ffn_gate_norm_quant", False) if isinstance(extra, dict) else False
+    )
+    if type(norm_fusion) is not bool:
+        raise ValueError("ffn_gate_norm_quant must be a boolean")
+    if norm_fusion and vendor_name != "iluvatar":
+        raise ValueError("deferred gate norm is supported only on Iluvatar")
     interleaved = (
         extra.get("ffn_w8a8_interleaved", False) if isinstance(extra, dict) else False
     )
@@ -283,7 +412,7 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     prepared = [
         (
             layer,
-            QuantizedRMSNorm(norm) if vendor_name == "metax" else norm,
+            (QuantizedRMSNorm(norm) if vendor_name == "metax" else norm),
             W8A8GateUp(
                 projection,
                 interleaved=interleaved,

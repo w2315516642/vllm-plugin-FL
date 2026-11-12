@@ -177,6 +177,9 @@ def _store_output_td(
 
 @triton.jit
 def kernel_unified_attention(
+    task_seq_ptr,
+    task_block_ptr,
+    HAS_TASK_PLAN: tl.constexpr,
     # Output destination for the 2D path.  In 3D mode per-segment partials
     # go to the ``segm_*`` tensors (see bottom of signature) and
     # ``output_ptr`` is unused (callers may pass any non-null pointer).
@@ -288,15 +291,27 @@ def kernel_unified_attention(
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2) if IS_3D else 0
 
-    (
-        seq_idx,
-        q_block_local_idx,
-        cur_batch_in_all_start_index,
-        cur_batch_query_len,
-        seq_len,
-    ) = resolve_seq_and_query_len(
-        query_start_len_ptr, seq_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q
-    )
+    if HAS_TASK_PLAN:
+        seq_idx = tl.load(task_seq_ptr + q_block_global_idx)
+        if seq_idx < 0:
+            return
+        q_block_local_idx = tl.load(task_block_ptr + q_block_global_idx)
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+        query_end = tl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_query_len = query_end - cur_batch_in_all_start_index
+        if cur_batch_query_len <= 1:
+            return
+        seq_len = tl.load(seq_lens_ptr + seq_idx)
+    else:
+        (
+            seq_idx,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            cur_batch_query_len,
+            seq_len,
+        ) = resolve_seq_and_query_len(
+            query_start_len_ptr, seq_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q
+        )
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
@@ -825,6 +840,8 @@ def unified_attention(
     decode_tile_size: int | None = None,
     decode_num_warps: int = 4,
     decode_num_stages: int = 3,
+    task_seq=None,
+    task_block=None,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -839,9 +856,9 @@ def unified_attention(
         KVQuantMode.FP8_PER_TOKEN_HEAD,
     )
     if use_per_token_head_scales:
-        assert k_scale_cache is not None and v_scale_cache is not None, (
-            f"{kv_quant_mode.name} requires k_scale_cache / v_scale_cache"
-        )
+        assert (
+            k_scale_cache is not None and v_scale_cache is not None
+        ), f"{kv_quant_mode.name} requires k_scale_cache / v_scale_cache"
 
     use_mm_prefix = False
     max_mm_ranges = 0
@@ -1074,6 +1091,9 @@ def unified_attention(
         launch_kwargs["num_stages"] = launch_num_stages
 
     kernel_unified_attention[grid](
+        task_seq_ptr=task_seq,
+        task_block_ptr=task_block,
+        HAS_TASK_PLAN=task_seq is not None,
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
         segm_max_ptr=segm_max_ptr,

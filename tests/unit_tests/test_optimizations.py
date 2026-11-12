@@ -811,3 +811,112 @@ def test_int8_pattern_fuses_both_weight_layouts(interleaved):
     )
     expected = (F.silu(a) * b).bfloat16()
     torch.testing.assert_close(graph(*inputs).cpu(), expected, rtol=0.03, atol=0.03)
+
+
+@pytest.mark.skipif(
+    getattr(current_platform, "vendor_name", None) != "iluvatar",
+    reason="Iluvatar Quest",
+)
+@torch.inference_mode()
+def test_quest_selected_pages_and_graph_replay(monkeypatch):
+    from vllm_fl.attention.iluvatar import _quest as quest
+
+    torch.manual_seed(150)
+    n, length = 2, 4608
+    pages = (length + 15) // 16
+    cache = torch.randn((n * pages, 2, 16, 2, 128), device="cuda", dtype=torch.bfloat16)
+    table = (
+        torch.randperm(n * pages, device="cuda", dtype=torch.int64)
+        .reshape(n, pages)
+        .int()
+    )
+    lens = torch.tensor([length, 4096], device="cuda", dtype=torch.int32)
+    q = torch.randn((n, 16, 128), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    state = quest.QuestState(q.device, n, length)
+    low, high = state.pool("test", cache)
+    low.copy_(cache[:, 0].amin(1))
+    high.copy_(cache[:, 0].amax(1))
+    monkeypatch.setattr(
+        quest,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            _quest_score_tiles=state.workspace["scores"].shape[-1] // 16
+        ),
+    )
+    layer = SimpleNamespace(layer_name="test")
+    meta = SimpleNamespace(seq_lens=lens, block_table=table)
+    for _ in range(2):
+        state.run(layer, q, cache, meta, out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        state.run(layer, q, cache, meta, out)
+    for lengths in [[4608, 4096], [4097, 17]]:
+        lens.copy_(torch.tensor(lengths, device=q.device, dtype=torch.int32))
+        q.normal_()
+        graph.replay()
+        ids = state.workspace["ids"].cpu().long()
+        values, query = cache.cpu().float(), q.cpu().float()
+        expected = torch.empty_like(query)
+        for row, size in enumerate(lengths):
+            count = min((size + 15) // 16, 256)
+            for head in range(2):
+                selected = ids[row, head, :count]
+                positions = torch.arange(count * 16)
+                # The final selected page is always the last logical page.
+                valid = positions < (count - 1) * 16 + ((size - 1) % 16 + 1)
+                key = values[selected, 0, :, head].reshape(-1, 128)[valid]
+                value = values[selected, 1, :, head].reshape(-1, 128)[valid]
+                scores = query[row, head * 8 : (head + 1) * 8] @ key.T * (128**-0.5)
+                expected[row, head * 8 : (head + 1) * 8] = scores.softmax(-1) @ value
+        torch.testing.assert_close(out.cpu(), expected.bfloat16(), rtol=0.02, atol=0.02)
+
+
+@pytest.mark.skipif(
+    getattr(current_platform, "vendor_name", None) != "iluvatar",
+    reason="Iluvatar RoPE/KV summary",
+)
+@torch.inference_mode()
+def test_rope_summary_preserves_rotated_keys_cache_and_complete_pages():
+    from vllm_fl.attention.iluvatar._rope_kernels import launch_rope, launch_summary
+
+    torch.manual_seed(151)
+    q = torch.randn((6, 16, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((6, 2, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    positions = torch.tensor([14, 15, 0, 1, 14, 15], device="cuda", dtype=torch.int64)
+    slots = torch.tensor([14, 15, 16, 17, 46, 47], device="cuda", dtype=torch.int64)
+    cs = torch.randn((64, 128), device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn((4, 2, 16, 2, 128), device="cuda", dtype=torch.bfloat16)
+    original = cache.clone()
+    low = torch.full((4, 2, 128), -7, device="cuda", dtype=torch.bfloat16)
+    high = torch.full_like(low, 7)
+    qo, ko, expected_q, expected_k = (
+        torch.empty_like(q),
+        torch.empty_like(k),
+        torch.empty_like(q),
+        torch.empty_like(k),
+    )
+    launch_rope(
+        q,
+        k,
+        v,
+        positions,
+        cs,
+        expected_q,
+        expected_k,
+        original,
+        slots,
+        fused=True,
+        block=512,
+        warps=4,
+    )
+    launch_summary(q, k, v, positions, cs, qo, ko, cache, slots, low, high)
+    for actual, expected in [(qo, expected_q), (ko, expected_k), (cache, original)]:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for page in [0, 2]:
+        torch.testing.assert_close(low[page], original[page, 0].amin(0), rtol=0, atol=0)
+        torch.testing.assert_close(
+            high[page], original[page, 0].amax(0), rtol=0, atol=0
+        )
+    assert torch.all(low[[1, 3]] == -7) and torch.all(high[[1, 3]] == 7)

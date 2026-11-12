@@ -65,6 +65,17 @@ class TunedTritonAttentionImpl(TritonAttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        state = getattr(self, "_quest_state", None)
+        if (
+            state is not None
+            and attn_metadata.max_query_len == 1
+            and query.dtype == torch.bfloat16
+            and query.shape[1:] == (16, 128)
+            and kv_cache.shape[1:] == (2, 16, 2, 128)
+            and output_scale is None
+        ):
+            return state.run(layer, query, kv_cache, attn_metadata, output)
+
         assert attn_metadata.use_cascade is False
 
         # IMPORTANT!
@@ -143,7 +154,7 @@ class TunedTritonAttentionImpl(TritonAttentionImpl):
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
-        tuned_unified_attention(
+        attention_dispatch(
             q=query[:num_actual_tokens],
             k=key_cache,
             v=value_cache,
@@ -233,3 +244,11 @@ def tuned_unified_attention(**kwargs):
             kwargs.update(decode_row_mode="bm8", defer_lsum=True)
             return _decode.unified_attention(**kwargs)
     return _unified.unified_attention(**kwargs)
+
+
+def attention_dispatch(**kwargs):
+    if kwargs["max_seqlen_q"] > 1 and len(kwargs["seqused_k"]) > 1:
+        from ._mixed import mixed_attention
+
+        return mixed_attention(kwargs)
+    return tuned_unified_attention(**kwargs)

@@ -3683,9 +3683,17 @@ class ModelRunnerFL(
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
+            from vllm_fl.sampling import SamplerFL
+
+            extra = {}
+            if isinstance(self.sampler, SamplerFL):
+                extra["all_unit_temperature"] = self.sampler.temperatures_are_one(
+                    self.input_batch, sampling_metadata
+                )
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
+                **extra,
             )
 
         # Update spec_token_ids with real draft tokens from pre step only when
@@ -4427,7 +4435,7 @@ class ModelRunnerFL(
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
         with (
-            set_forward_context(
+            self._set_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
@@ -5375,6 +5383,15 @@ class ModelRunnerFL(
                 if quantized_qkv:
                     logger.info("Enabled paired RMSNorm/QKV W8A8 for %d layers", quantized_qkv)
 
+                from vllm_fl.quantization.w8a8.ffn import install_gate_norm_quant
+
+                fused_gate_norms = install_gate_norm_quant(
+                    self.model, self.vllm_config,
+                    getattr(current_platform, "vendor_name", ""),
+                )
+                if fused_gate_norms:
+                    logger.info("Enabled paired gate Norm/quant for %d layers", fused_gate_norms)
+
                 from vllm_fl.optimizations.config import feature_enabled
                 from vllm_fl.optimizations.model import install_model_optimizations
 
@@ -5393,6 +5410,17 @@ class ModelRunnerFL(
                 )
                 if self._prefill_tail is not None:
                     logger.info("Enabled demand-driven final-layer prefill computation")
+
+                self._quest_graphs = None
+                if optimized["triton_attention"] and feature_enabled(
+                    self.vllm_config, "quest_attention"
+                ):
+                    from vllm_fl.attention.iluvatar._rope import install
+
+                    self._quest_graphs = install(self.model, self.vllm_config)
+                    if self._quest_graphs is not None:
+                        logger.info("Enabled model-local Quest, RoPE/KV fusion and page-capacity Graphs")
+
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
@@ -6138,7 +6166,7 @@ class ModelRunnerFL(
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
-                set_forward_context(
+                self._set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
@@ -6859,6 +6887,12 @@ class ModelRunnerFL(
         )
         return cuda_graph_size
 
+    def _set_forward_context(self, *args, **kwargs):
+        graphs = getattr(self, "_quest_graphs", None)
+        if graphs is None:
+            return set_forward_context(*args, **kwargs)
+        return graphs.context(set_forward_context, *args, **kwargs)
+
     def _warmup_and_capture(
         self,
         desc: BatchDescriptor,
@@ -6867,6 +6901,17 @@ class ModelRunnerFL(
         allow_microbatching: bool = False,
         num_warmups: int | None = None,
     ):
+        graphs = getattr(self, "_quest_graphs", None)
+        if (
+            graphs is not None
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and graphs.capture_capacity is None
+        ):
+            return graphs.capture(
+                self._warmup_and_capture, desc, cudagraph_runtime_mode,
+                profile_seq_lens=profile_seq_lens,
+                allow_microbatching=allow_microbatching, num_warmups=num_warmups,
+            )
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL

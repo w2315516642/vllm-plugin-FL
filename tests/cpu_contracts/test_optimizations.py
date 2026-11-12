@@ -7,6 +7,7 @@ import importlib.util
 import sys
 import types
 import weakref
+from contextvars import ContextVar
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,48 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_temperature_identity_scope_and_fallback():
+    class Parent(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.topk_topp_sampler = torch.nn.Identity()
+
+        @staticmethod
+        def apply_temperature(logits, temp, all_random):
+            return logits / temp[:, None]
+
+        def forward(self, logits, sampling_metadata):
+            if getattr(sampling_metadata, "fail", False):
+                raise RuntimeError("test cleanup")
+            return self.apply_temperature(
+                logits, sampling_metadata.temperature, sampling_metadata.all_random
+            )
+
+    source = ast.parse((ROOT / "vllm_fl/sampling.py").read_text())
+    classes = [n for n in source.body if isinstance(n, ast.ClassDef)]
+    env = {"nn": torch.nn, "torch": torch, "Sampler": Parent, "ContextVar": ContextVar}
+    exec(
+        compile(ast.Module(body=classes, type_ignores=[]), "sampling-scope", "exec"),
+        env,
+    )
+    sampler = env["SamplerFL"]()
+    batch = types.SimpleNamespace(num_reqs=2, temperature_cpu_tensor=torch.ones(2))
+    meta = types.SimpleNamespace(all_random=True, temperature=torch.ones(2))
+    x = torch.randn(2, 16)
+    assert sampler.temperatures_are_one(batch, meta)
+    assert sampler(x, meta, all_unit_temperature=True) is x
+    batch.temperature_cpu_tensor[1] = 0.5
+    meta.temperature[1] = 0.5
+    assert not sampler.temperatures_are_one(batch, meta)
+    torch.testing.assert_close(sampler(x, meta), x / meta.temperature[:, None])
+    meta.fail = True
+    with pytest.raises(RuntimeError, match="test cleanup"):
+        sampler(x, meta, all_unit_temperature=True)
+    assert not sampler._unit_temperature.get()
+    meta.all_random = False
+    assert not sampler.temperatures_are_one(batch, meta)
 
 
 def load(name, path):
@@ -40,6 +83,8 @@ def test_defaults_preserve_other_configuration(config_api, vendor):
         assert cfg.additional_config is extra
     else:
         assert cfg.additional_config["ffn_w8a8"] is True
+        if vendor == "iluvatar":
+            assert cfg.additional_config["ffn_gate_norm_quant"] is True
 
 
 @pytest.mark.parametrize("vendor", ["metax", "iluvatar"])
@@ -61,6 +106,7 @@ def test_profile_is_idempotent_and_keeps_explicit_overrides(config_api, vendor):
     assert first["qkv_w8a8"] is False
     assert first["ffn_w8a8"] is True
     assert first["ffn_down_w8a8"] is (vendor == "metax")
+    assert first["ffn_gate_norm_quant"] is False
     assert extra == {"optimization_profile": "competition", "qkv_w8a8": False}
 
 
@@ -181,6 +227,24 @@ def test_dynamic_projection_fake_contract_has_no_padding_leak(weights, m):
         y = dynamic_int8_linear(x, w, scale, "gate")
         assert y.shape == (m, 12288)
         assert y.dtype == torch.bfloat16 and y.is_contiguous()
+
+
+@pytest.mark.parametrize("m", [0, 32, 33, 129])
+def test_padded_gate_norm_fake_preserves_logical_output_rows(weights, m):
+    with FakeTensorMode():
+        x = torch.empty((m, 2048), device="cuda", dtype=torch.bfloat16)
+        r = torch.empty_like(x)
+        nw = torch.empty(2048, device="cuda", dtype=x.dtype)
+        q, scale, residual = weights.gate_norm_quant(x, r, nw, 1e-6)
+        multiple = 32 if m <= 32 else 128
+        capacity = ((m + multiple - 1) // multiple) * multiple
+        assert q.shape == (capacity, 2048) and q.dtype == torch.int8
+        assert scale.shape == (capacity, 1) and scale.dtype == torch.float32
+        assert residual.shape == x.shape and residual.dtype == x.dtype
+        w = torch.empty((12288, 2048), device="cuda", dtype=torch.int8).t()
+        sw = torch.empty(12288, device="cuda", dtype=torch.float32)
+        y = weights.gate_from_padded_int8(x, q, scale, w, sw)
+        assert y.shape == (m, 12288) and y.dtype == x.dtype
 
 
 def test_filter_component_preserves_generator_and_original_return(monkeypatch):
@@ -345,3 +409,148 @@ def test_impl_extension_preserves_state_and_does_not_modify_original():
     assert type(old) is Original
     assert isinstance(new, Original) and new is not old
     assert new.cache is old.cache and new.backend is old.backend
+
+
+@pytest.fixture
+def quest_graph_api():
+    """Execute the actual Graph policy with a minimal native descriptor contract."""
+    from contextlib import contextmanager
+    from dataclasses import asdict, dataclass
+    from enum import Enum
+
+    @dataclass(frozen=True)
+    class BatchDescriptor:
+        num_tokens: int
+        num_reqs: int | None = None
+        uniform: bool = False
+        has_lora: bool = False
+        num_active_loras: int = 0
+
+    class Mode(Enum):
+        NONE = 0
+        FULL = 1
+
+    ctx = types.SimpleNamespace()
+    env = dict(
+        __name__=__name__,
+        contextmanager=contextmanager,
+        asdict=asdict,
+        dataclass=dataclass,
+        BatchDescriptor=BatchDescriptor,
+        CUDAGraphMode=Mode,
+        get_forward_context=lambda: ctx,
+    )
+    path = ROOT / "vllm_fl/attention/iluvatar/_graph.py"
+    tree = ast.parse(path.read_text())
+    tree.body = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))]
+    exec(compile(tree, str(path), "exec"), env)
+    return types.SimpleNamespace(**env, current_context=ctx)
+
+
+@pytest.mark.parametrize(
+    "length,capacity",
+    [
+        (0, 16),
+        (16, 16),
+        (17, 16),
+        (256, 16),
+        (272, 16),
+        (273, 32),
+        (4096, 256),
+        (4097, 256),
+        (4113, 512),
+        (131072, 8192),
+        (131073, 8192),
+        (131089, 16384),
+        (262145, 16384),
+    ],
+)
+def test_quest_page_capacity_model_length_boundaries(quest_graph_api, length, capacity):
+    assert quest_graph_api.page_capacity(length) == capacity
+
+
+def test_quest_graph_key_uses_capacity_without_mutating_native_descriptor(
+    quest_graph_api,
+):
+    from contextlib import contextmanager
+
+    api = quest_graph_api
+    policy = api.QuestGraphs(131072)
+    desc = api.BatchDescriptor(64, 64, True, False, 0)
+    calls = []
+
+    @contextmanager
+    def original(metadata, config, **kwargs):
+        calls.append(kwargs)
+        yield
+
+    for maximum in [4096, 4113, 16384]:
+        meta = {"layer": types.SimpleNamespace(max_seq_len=maximum)}
+        config = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(max_model_len=131072)
+        )
+        with policy.context(
+            original,
+            meta,
+            config,
+            cudagraph_runtime_mode=api.CUDAGraphMode.FULL,
+            batch_descriptor=desc,
+        ):
+            assert (
+                api.current_context._quest_score_tiles
+                == api.page_capacity(maximum) // 16
+            )
+    keys = [c["batch_descriptor"] for c in calls]
+    assert len(set(keys)) == 3
+    assert all(
+        k.num_tokens == desc.num_tokens and k.num_reqs == desc.num_reqs and k.uniform
+        for k in keys
+    )
+    assert not hasattr(desc, "page_capacity")
+
+
+def test_quest_capture_largest_first_and_restores_state_after_failure(quest_graph_api):
+    api = quest_graph_api
+    policy, other = api.QuestGraphs(131072), api.QuestGraphs(131072)
+    calls = []
+
+    def capture(desc, mode, **kwargs):
+        calls.append((policy.capture_capacity, kwargs["profile_seq_lens"]))
+        assert other.capture_capacity is None
+
+    policy.capture(
+        capture,
+        api.BatchDescriptor(64, 64, True),
+        api.CUDAGraphMode.FULL,
+        profile_seq_lens=131072,
+    )
+    capacities = [1 << power for power in range(13, 3, -1)]
+    assert calls == [(cap, min(131072, (cap + 1) * 16)) for cap in capacities]
+    assert policy.capture_capacity is None
+
+    def failure(*args, **kwargs):
+        raise RuntimeError("capture failed")
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        policy.capture(failure, api.BatchDescriptor(1), api.CUDAGraphMode.FULL)
+    assert policy.capture_capacity is None
+
+
+def test_quest_summaries_follow_model_and_cache_allocation():
+    path = ROOT / "vllm_fl/attention/iluvatar/_quest.py"
+    tree = ast.parse(path.read_text())
+    tree.body = [
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "QuestState"
+    ]
+    env = {"torch": torch}
+    exec(compile(tree, str(path), "exec"), env)
+    cls = env["QuestState"]
+    first, second = cls.__new__(cls), cls.__new__(cls)
+    first.pools, second.pools = {}, {}
+    cache = torch.empty((8, 2, 16, 2, 128), dtype=torch.bfloat16)
+    lo, hi = first.pool("layer", cache[:4])
+    assert first.pool("layer", cache[:4])[0] is lo
+    assert second.pool("layer", cache[:4])[0] is not lo
+    # Profiling and real caches can share an address while changing capacity.
+    larger = first.pool("layer", cache)
+    assert larger[0].shape[0] == 8 and larger[0] is not lo

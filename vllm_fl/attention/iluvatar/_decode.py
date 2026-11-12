@@ -177,6 +177,7 @@ def _store_output_td(
 
 @triton.jit
 def kernel_unified_attention(
+    MIXED_BATCH: tl.constexpr,
     # Output destination for the 2D path.  In 3D mode per-segment partials
     # go to the ``segm_*`` tensors (see bottom of signature) and
     # ``output_ptr`` is unused (callers may pass any non-null pointer).
@@ -301,6 +302,8 @@ def kernel_unified_attention(
         cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
         query_end = tl.load(query_start_len_ptr + seq_idx + 1)
         cur_batch_query_len = query_end - cur_batch_in_all_start_index
+        if MIXED_BATCH and cur_batch_query_len != 1:
+            return
         seq_len = tl.load(seq_lens_ptr + seq_idx)
     else:
         (
@@ -672,7 +675,11 @@ def kernel_unified_attention(
             )
         else:
             segm_output_offset = (
-                query_offset_0[:, None].to(tl.int64)
+                (
+                    tl.full((BLOCK_M, 1), seq_idx, tl.int64)
+                    if MIXED_BATCH
+                    else query_offset_0[:, None].to(tl.int64)
+                )
                 * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
                 + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
                 + segm_idx * HEAD_SIZE_PADDED
@@ -686,7 +693,7 @@ def kernel_unified_attention(
         store_segm_reduce_scalars(
             segm_max_ptr,
             segm_expsum_ptr,
-            query_offset_0,
+            tl.full((BLOCK_M,), seq_idx, tl.int32) if MIXED_BATCH else query_offset_0,
             query_offset_1,
             segm_idx,
             M,
@@ -739,6 +746,7 @@ def kernel_unified_attention(
 
 @triton.jit
 def reduce_segments(
+    MIXED_BATCH: tl.constexpr,
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     segm_output_ptr,
     # [num_tokens, num_query_heads, max_num_segments, head_size]
@@ -761,13 +769,20 @@ def reduce_segments(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
-    query_token_idx = tl.program_id(0)
-    query_head_idx = tl.program_id(1)
+    if MIXED_BATCH:
+        seq_idx = tl.program_id(0)
+        query_head_idx = tl.program_id(1)
+        query_token_idx = tl.load(query_start_len_ptr + seq_idx)
+        query_end = tl.load(query_start_len_ptr + seq_idx + 1)
+        if query_end - query_token_idx != 1:
+            return
+    else:
+        query_token_idx = tl.program_id(0)
+        query_head_idx = tl.program_id(1)
 
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
-    )
-
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
+        )
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
@@ -784,7 +799,8 @@ def reduce_segments(
 
     # load segment maxima
     segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        (seq_idx if MIXED_BATCH else query_token_idx).to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_head_idx * NUM_SEGMENTS_PER_SEQ
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
     )
@@ -798,7 +814,7 @@ def reduce_segments(
 
     # load, rescale, and add segment attention outputs
     segm_output_offset = (
-        query_token_idx.to(tl.int64)
+        (seq_idx if MIXED_BATCH else query_token_idx).to(tl.int64)
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
         + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
@@ -903,6 +919,7 @@ def unified_attention(
     decode_tile_size: int | None = None,
     decode_num_warps: int = 4,
     decode_num_stages: int = 3,
+    mixed_batch: bool = False,
     direct_decode: bool = True,
     defer_lsum: bool = True,
     decode_row_mode: str = "full",
@@ -920,9 +937,9 @@ def unified_attention(
         KVQuantMode.FP8_PER_TOKEN_HEAD,
     )
     if use_per_token_head_scales:
-        assert k_scale_cache is not None and v_scale_cache is not None, (
-            f"{kv_quant_mode.name} requires k_scale_cache / v_scale_cache"
-        )
+        assert (
+            k_scale_cache is not None and v_scale_cache is not None
+        ), f"{kv_quant_mode.name} requires k_scale_cache / v_scale_cache"
 
     use_mm_prefix = False
     max_mm_ranges = 0
@@ -1188,6 +1205,7 @@ def unified_attention(
         launch_kwargs["num_stages"] = launch_num_stages
 
     kernel_unified_attention[grid](
+        MIXED_BATCH=mixed_batch,
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
         segm_max_ptr=segm_max_ptr,
@@ -1284,7 +1302,8 @@ def unified_attention(
     )
 
     if use_3d:
-        reduce_segments[(q.shape[0], num_query_heads)](
+        reduce_segments[(num_seqs if mixed_batch else q.shape[0], num_query_heads)](
+            MIXED_BATCH=mixed_batch,
             output_ptr=out,
             segm_output_ptr=softmax_segm_output,
             segm_max_ptr=softmax_segm_max,
