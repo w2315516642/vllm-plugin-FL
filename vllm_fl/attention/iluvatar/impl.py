@@ -239,10 +239,8 @@ def tuned_unified_attention(**kwargs):
             )
         )
         if direct:
-            from . import _decode
-
-            kwargs.update(decode_row_mode="bm8", defer_lsum=True)
-            return _decode.unified_attention(**kwargs)
+            kwargs.update(direct_decode=True, decode_row_mode="bm8", defer_lsum=True)
+            return _unified.unified_attention(**kwargs)
     return _unified.unified_attention(**kwargs)
 
 

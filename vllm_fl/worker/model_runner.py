@@ -5344,83 +5344,12 @@ class ModelRunnerFL(
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 
-                from vllm_fl.quantization.w8a8.ffn import install_ffn_w8a8
+                from vllm_fl.optimizations.model import configure_model
 
-                quantized_ffns = install_ffn_w8a8(
-                    self.model,
-                    self.vllm_config,
-                    getattr(current_platform, "vendor_name", ""),
-                )
-                if quantized_ffns:
-                    logger.info("Enabled gate/up W8A8 for %d FFNs", quantized_ffns)
-
-                from vllm_fl.quantization.w8a8.projections import install_ffn_down_w8a8
-
-                quantized_downs = install_ffn_down_w8a8(
-                    self.model,
-                    self.vllm_config,
-                    getattr(current_platform, "vendor_name", ""),
-                )
-                if quantized_downs:
-                    logger.info("Enabled down W8A8 for %d FFNs", quantized_downs)
-
-                from vllm_fl.quantization.w8a8.projections import install_attention_o_w8a8
-
-                quantized_o = install_attention_o_w8a8(
-                    self.model,
-                    self.vllm_config,
-                    getattr(current_platform, "vendor_name", ""),
-                )
-                if quantized_o:
-                    logger.info("Enabled O projection W8A8 for %d attention layers", quantized_o)
-
-                from vllm_fl.quantization.w8a8.projections import install_qkv_w8a8
-
-                quantized_qkv = install_qkv_w8a8(
+                self._prefill_tail, self._quest_graphs = configure_model(
                     self.model, self.vllm_config,
                     getattr(current_platform, "vendor_name", ""),
                 )
-                if quantized_qkv:
-                    logger.info("Enabled paired RMSNorm/QKV W8A8 for %d layers", quantized_qkv)
-
-                from vllm_fl.quantization.w8a8.ffn import install_gate_norm_quant
-
-                fused_gate_norms = install_gate_norm_quant(
-                    self.model, self.vllm_config,
-                    getattr(current_platform, "vendor_name", ""),
-                )
-                if fused_gate_norms:
-                    logger.info("Enabled paired gate Norm/quant for %d layers", fused_gate_norms)
-
-                from vllm_fl.optimizations.config import feature_enabled
-                from vllm_fl.optimizations.model import install_model_optimizations
-
-                optimized = install_model_optimizations(
-                    self.model, self.vllm_config,
-                    getattr(current_platform, "vendor_name", ""),
-                )
-                if any(optimized.values()):
-                    logger.info("Installed model-local optimizations: %s", optimized)
-
-                from vllm_fl.worker.prefill_tail import make_prefill_tail
-
-                self._prefill_tail = (
-                    make_prefill_tail(self.model, self.vllm_config)
-                    if feature_enabled(self.vllm_config, "prefill_tail") else None
-                )
-                if self._prefill_tail is not None:
-                    logger.info("Enabled demand-driven final-layer prefill computation")
-
-                self._quest_graphs = None
-                if optimized["triton_attention"] and feature_enabled(
-                    self.vllm_config, "quest_attention"
-                ):
-                    from vllm_fl.attention.iluvatar._rope import install
-
-                    self._quest_graphs = install(self.model, self.vllm_config)
-                    if self._quest_graphs is not None:
-                        logger.info("Enabled model-local Quest, RoPE/KV fusion and page-capacity Graphs")
-
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the

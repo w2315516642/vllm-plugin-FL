@@ -158,6 +158,7 @@ def weights():
     base = "_submission_contracts"
     for suffix, rel in [
         ("", ""),
+        (".optimizations", "optimizations"),
         (".quantization", "quantization"),
         (".quantization.w8a8", "quantization/w8a8"),
     ]:
@@ -293,10 +294,11 @@ def policy(monkeypatch):
     package.__path__ = []
     unified = types.ModuleType(package.__name__ + "._unified")
     unified.is_batch_invariant = False
-    unified.unified_attention = lambda **kw: ("unified", kw)
-    decode = types.ModuleType(package.__name__ + "._decode")
-    decode.unified_attention = lambda **kw: ("decode", kw)
-    for module in [package, unified, decode]:
+    unified.unified_attention = lambda **kw: (
+        "decode" if kw.get("direct_decode") else "unified",
+        kw,
+    )
+    for module in [package, unified]:
         monkeypatch.setitem(sys.modules, module.__name__, module)
     source = ast.parse((ROOT / "vllm_fl/attention/iluvatar/impl.py").read_text())
     fn = next(n for n in source.body if isinstance(n, ast.FunctionDef))
@@ -554,3 +556,83 @@ def test_quest_summaries_follow_model_and_cache_allocation():
     # Profiling and real caches can share an address while changing capacity.
     larger = first.pool("layer", cache)
     assert larger[0].shape[0] == 8 and larger[0] is not lo
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "dtype",
+        "runner_type",
+        "is_encoder_decoder",
+        "multimodal_config",
+        "quant_config",
+        "lora_config",
+        "speculative_config",
+        "kv_transfer_config",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "decode_context_parallel_size",
+        "prefill_context_parallel_size",
+        "use_ubatching",
+        "cpu_offload_gb",
+        "offload_group_size",
+        "stock_compile",
+    ],
+)
+def test_shared_dense_model_contract(config_api, monkeypatch, change):
+    config_module = types.ModuleType("vllm.config")
+    config_module.CompilationMode = types.SimpleNamespace(STOCK_TORCH_COMPILE="stock")
+    monkeypatch.setitem(sys.modules, "vllm.config", config_module)
+    ns = types.SimpleNamespace
+    model = ns(
+        dtype=torch.bfloat16,
+        runner_type="generate",
+        is_encoder_decoder=False,
+        multimodal_config=None,
+    )
+    parallel = ns(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        decode_context_parallel_size=1,
+        prefill_context_parallel_size=1,
+        use_ubatching=False,
+    )
+    cfg = ns(
+        model_config=model,
+        parallel_config=parallel,
+        quant_config=None,
+        lora_config=None,
+        speculative_config=None,
+        kv_transfer_config=None,
+        compilation_config=ns(mode="vllm"),
+        offload_config=ns(uva=ns(cpu_offload_gb=0), prefetch=ns(offload_group_size=0)),
+    )
+    if change == "dtype":
+        model.dtype = torch.float16
+    elif change == "runner_type":
+        model.runner_type = "pooling"
+    elif change in ["is_encoder_decoder", "multimodal_config"]:
+        setattr(model, change, True)
+    elif change in [
+        "quant_config",
+        "lora_config",
+        "speculative_config",
+        "kv_transfer_config",
+    ]:
+        setattr(cfg, change, object())
+    elif change and change.endswith("parallel_size"):
+        setattr(parallel, change, 2)
+    elif change == "use_ubatching":
+        parallel.use_ubatching = True
+    elif change == "cpu_offload_gb":
+        cfg.offload_config.uva.cpu_offload_gb = 1
+    elif change == "offload_group_size":
+        cfg.offload_config.prefetch.offload_group_size = 1
+    elif change == "stock_compile":
+        cfg.compilation_config.mode = "stock"
+    assert config_api.supports_local_dense(cfg) is (change is None)
+    if change == "stock_compile":
+        assert config_api.supports_local_dense(cfg, allow_stock_compile=True)

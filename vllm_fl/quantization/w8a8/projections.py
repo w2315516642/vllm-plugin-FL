@@ -4,6 +4,8 @@
 import torch
 from torch import nn
 
+from ...optimizations.config import feature_enabled, supports_local_dense
+
 from .ffn import QuantizedRMSNorm, QuantizedTokens, _quant, quantize_channelwise_weight
 
 
@@ -43,8 +45,8 @@ def _dynamic_fake(x, weight, scale_w, kind):
     )
 
 
-class W8A8Down(nn.Module):
-    """Bias-free TP=1 projection with the Linear `(output, None)` contract."""
+class W8A8Linear(nn.Module):
+    """Shared quantized weight storage and the Linear `(output, None)` contract."""
 
     def __init__(self, original):
         super().__init__()
@@ -55,18 +57,27 @@ class W8A8Down(nn.Module):
 
     def forward(self, x):
         if x.ndim != 2 or x.shape[1] != self.weight.shape[0]:
-            raise ValueError("down input must be [tokens, in_features]")
+            raise ValueError(f"{self.input_name} input must be [tokens, in_features]")
         if x.dtype != self.output_dtype or x.device != self.weight.device:
-            raise ValueError("down input must match the loaded weight dtype/device")
+            raise ValueError(
+                f"{self.input_name} input must match the loaded weight dtype/device"
+            )
         if x.shape[0] == 0:
             return x.new_empty((0, self.weight.shape[1])), None
-        # No value-dependent host checks or loading-time weight rearrangements.
-        return dynamic_int8_linear(
-            x.contiguous(), self.weight, self.weight_scale, "down"
-        ), None
+        return (
+            dynamic_int8_linear(
+                x.contiguous(), self.weight, self.weight_scale, self.kind
+            ),
+            None,
+        )
 
 
-def _eligible_down(projection, linear_type, method_type):
+class W8A8Down(W8A8Linear):
+    kind = "down"
+    input_name = "down"
+
+
+def _eligible_row_linear(projection, linear_type, method_type):
     """Keep unsupported Linear contracts/implementations on their old path."""
     if type(projection) is not linear_type:
         return False
@@ -89,31 +100,26 @@ def _eligible_down(projection, linear_type, method_type):
     )
 
 
-def _install_down_prepared(mlps):
-    # Finish conversion/finite checks before replacing any projection. Do not
-    # retain the BF16 copy; unsupported modules are filtered before this point.
-    prepared = [(mlp, W8A8Down(mlp.down_proj)) for mlp in mlps]
-    for mlp, projection in prepared:
-        mlp.down_proj = projection
+def _install_projections(parents, attribute, component):
+    # Complete weight conversion before mutating any module.
+    prepared = [(parent, component(getattr(parent, attribute))) for parent in parents]
+    for parent, projection in prepared:
+        setattr(parent, attribute, projection)
     return len(prepared)
 
 
 def install_ffn_down_w8a8(model, config, vendor_name: str) -> int:
-    """Install independently of gate/up quantization; disabled by default.
+    """Install the MetaX down projection independently of gate/up.
 
     No model name, layer index, M value or fixed matrix shape is matched.
     Unsupported configurations retain their original down projections. Other
     vendors and distributed/offloaded/adapter paths need separate validation.
     Call after checkpoint loading and before constructing prefill-tail views.
     """
-    extra = config.additional_config
-    enabled = extra.get("ffn_down_w8a8", False) if isinstance(extra, dict) else False
-    if type(enabled) is not bool:
-        raise ValueError("ffn_down_w8a8 must be a boolean")
+    enabled = feature_enabled(config, "ffn_down_w8a8")
     if not enabled or vendor_name != "metax":
         return 0
 
-    from vllm.config import CompilationMode
     from vllm.model_executor.layers.linear import (
         RowParallelLinear,
         UnquantizedLinearMethod,
@@ -122,27 +128,7 @@ def install_ffn_down_w8a8(model, config, vendor_name: str) -> int:
 
     from vllm_fl.utils import is_oot_enabled
 
-    mc, pc = config.model_config, config.parallel_config
-    if (
-        mc.dtype != torch.bfloat16
-        or mc.runner_type != "generate"
-        or mc.is_encoder_decoder
-        or mc.multimodal_config is not None
-        or config.quant_config is not None
-        or config.lora_config is not None
-        or config.speculative_config is not None
-        or pc.tensor_parallel_size != 1
-        or pc.pipeline_parallel_size != 1
-        or pc.data_parallel_size != 1
-        or pc.decode_context_parallel_size != 1
-        or pc.prefill_context_parallel_size != 1
-        or pc.use_ubatching
-        or config.kv_transfer_config is not None
-        or config.offload_config.uva.cpu_offload_gb > 0
-        or config.offload_config.prefetch.offload_group_size > 0
-        or config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
-        or not is_oot_enabled()
-    ):
+    if not supports_local_dense(config) or not is_oot_enabled():
         return 0
 
     mlps = []
@@ -152,86 +138,28 @@ def install_ffn_down_w8a8(model, config, vendor_name: str) -> int:
         down = layer.mlp.down_proj
         if isinstance(down, W8A8Down):
             continue
-        if _eligible_down(down, RowParallelLinear, UnquantizedLinearMethod):
+        if _eligible_row_linear(down, RowParallelLinear, UnquantizedLinearMethod):
             mlps.append(layer.mlp)
-    return _install_down_prepared(mlps)
+    return _install_projections(mlps, "down_proj", W8A8Down)
 
 
-class W8A8OProjection(nn.Module):
-    """Bias-free TP=1 projection with the Linear `(output, None)` contract."""
-
-    def __init__(self, original):
-        super().__init__()
-        weight, scale = quantize_channelwise_weight(original.weight)
-        self.weight = nn.Parameter(weight, requires_grad=False)
-        self.register_buffer("weight_scale", scale)
-        self.output_dtype = original.weight.dtype
-
-    def forward(self, x):
-        if x.ndim != 2 or x.shape[1] != self.weight.shape[0]:
-            raise ValueError("O projection input must be [tokens, in_features]")
-        if x.dtype != self.output_dtype or x.device != self.weight.device:
-            raise ValueError(
-                "O projection input must match the loaded weight dtype/device"
-            )
-        if x.shape[0] == 0:
-            return x.new_empty((0, self.weight.shape[1])), None
-        # No value-dependent host checks or loading-time weight rearrangements.
-        return dynamic_int8_linear(
-            x.contiguous(), self.weight, self.weight_scale, "o"
-        ), None
-
-
-def _eligible_o(projection, linear_type, method_type):
-    """Keep unsupported Linear contracts/implementations on their old path."""
-    if type(projection) is not linear_type:
-        return False
-    w = projection.weight
-    return (
-        type(projection.quant_method) is method_type
-        and projection.bias is None
-        and projection.return_bias
-        and projection.input_is_parallel
-        and projection.tp_size == 1
-        and projection.tp_rank == 0
-        and w.dtype == torch.bfloat16
-        and w.device.type == "cuda"
-        and w.ndim == 2
-        and w.is_contiguous()
-        and w.shape == (projection.output_size, projection.input_size_per_partition)
-        and w.shape[0] > 0
-        # Bound the per-token quantization reduction to the initial scope.
-        and 0 < w.shape[1] <= 8192
-    )
-
-
-def _install_o_prepared(attentions):
-    # Finish conversion/finite checks before replacing any projection. Do not
-    # retain the BF16 copy; unsupported modules are filtered before this point.
-    prepared = [
-        (attention, W8A8OProjection(attention.o_proj)) for attention in attentions
-    ]
-    for attention, projection in prepared:
-        attention.o_proj = projection
-    return len(prepared)
+class W8A8OProjection(W8A8Linear):
+    kind = "o"
+    input_name = "O projection"
 
 
 def install_attention_o_w8a8(model, config, vendor_name: str) -> int:
-    """Install independently of FFN quantization; disabled by default.
+    """Install the MetaX O projection independently of FFN quantization.
 
     No model name, layer index, M value or fixed matrix shape is matched.
     Unsupported configurations retain their original O projections. Other
     vendors and distributed/offloaded/adapter paths need separate validation.
     Call after checkpoint loading and before constructing prefill-tail views.
     """
-    extra = config.additional_config
-    enabled = extra.get("attention_o_w8a8", False) if isinstance(extra, dict) else False
-    if type(enabled) is not bool:
-        raise ValueError("attention_o_w8a8 must be a boolean")
+    enabled = feature_enabled(config, "attention_o_w8a8")
     if not enabled or vendor_name != "metax":
         return 0
 
-    from vllm.config import CompilationMode
     from vllm.model_executor.layers.linear import (
         RowParallelLinear,
         UnquantizedLinearMethod,
@@ -240,27 +168,7 @@ def install_attention_o_w8a8(model, config, vendor_name: str) -> int:
 
     from vllm_fl.utils import is_oot_enabled
 
-    mc, pc = config.model_config, config.parallel_config
-    if (
-        mc.dtype != torch.bfloat16
-        or mc.runner_type != "generate"
-        or mc.is_encoder_decoder
-        or mc.multimodal_config is not None
-        or config.quant_config is not None
-        or config.lora_config is not None
-        or config.speculative_config is not None
-        or pc.tensor_parallel_size != 1
-        or pc.pipeline_parallel_size != 1
-        or pc.data_parallel_size != 1
-        or pc.decode_context_parallel_size != 1
-        or pc.prefill_context_parallel_size != 1
-        or pc.use_ubatching
-        or config.kv_transfer_config is not None
-        or config.offload_config.uva.cpu_offload_gb > 0
-        or config.offload_config.prefetch.offload_group_size > 0
-        or config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
-        or not is_oot_enabled()
-    ):
+    if not supports_local_dense(config) or not is_oot_enabled():
         return 0
 
     attentions = []
@@ -273,18 +181,12 @@ def install_attention_o_w8a8(model, config, vendor_name: str) -> int:
         projection = layer.self_attn.o_proj
         if isinstance(projection, W8A8OProjection):
             continue
-        if _eligible_o(projection, RowParallelLinear, UnquantizedLinearMethod):
+        if _eligible_row_linear(projection, RowParallelLinear, UnquantizedLinearMethod):
             attentions.append(layer.self_attn)
-    return _install_o_prepared(attentions)
+    return _install_projections(attentions, "o_proj", W8A8OProjection)
 
 
-class W8A8QKV(nn.Module):
-    def __init__(self, original):
-        super().__init__()
-        weight, scale = quantize_channelwise_weight(original.weight)
-        self.weight = nn.Parameter(weight, requires_grad=False)
-        self.register_buffer("weight_scale", scale)
-        self.output_dtype = original.weight.dtype
+class W8A8QKV(W8A8Linear):
 
     def forward(self, x):
         if isinstance(x, QuantizedTokens):
@@ -312,9 +214,12 @@ class W8A8QKV(nn.Module):
             if x.shape[0] == 0:
                 return x.new_empty((0, self.weight.shape[1])), None
             q, sx = _quant(x.contiguous())
-        return scaled_int8_linear(
-            q.contiguous(), self.weight, sx.contiguous(), self.weight_scale, "qkv"
-        ), None
+        return (
+            scaled_int8_linear(
+                q.contiguous(), self.weight, sx.contiguous(), self.weight_scale, "qkv"
+            ),
+            None,
+        )
 
 
 def _install_qkv_prepared(pairs):
@@ -328,13 +233,9 @@ def _install_qkv_prepared(pairs):
 
 
 def install_qkv_w8a8(model, config, vendor_name):
-    extra = config.additional_config
-    enabled = extra.get("qkv_w8a8", False) if isinstance(extra, dict) else False
-    if type(enabled) is not bool:
-        raise ValueError("qkv_w8a8 must be a boolean")
+    enabled = feature_enabled(config, "qkv_w8a8")
     if not enabled or vendor_name not in ("metax", "iluvatar"):
         return 0
-    from vllm.config import CompilationMode
     from vllm.model_executor.layers.linear import (
         QKVParallelLinear,
         UnquantizedLinearMethod,
@@ -344,25 +245,8 @@ def install_qkv_w8a8(model, config, vendor_name):
     from vllm_fl.ops.layernorm import RMSNormFL
     from vllm_fl.utils import is_oot_enabled, use_flaggems_op
 
-    mc, pc = config.model_config, config.parallel_config
     if (
-        mc.dtype != torch.bfloat16
-        or mc.runner_type != "generate"
-        or mc.is_encoder_decoder
-        or mc.multimodal_config is not None
-        or config.quant_config is not None
-        or config.lora_config is not None
-        or config.speculative_config is not None
-        or pc.tensor_parallel_size != 1
-        or pc.pipeline_parallel_size != 1
-        or pc.data_parallel_size != 1
-        or pc.decode_context_parallel_size != 1
-        or pc.prefill_context_parallel_size != 1
-        or pc.use_ubatching
-        or config.kv_transfer_config is not None
-        or config.offload_config.uva.cpu_offload_gb > 0
-        or config.offload_config.prefetch.offload_group_size > 0
-        or config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+        not supports_local_dense(config)
         or not is_oot_enabled()
         or not use_flaggems_op("rms_norm")
     ):

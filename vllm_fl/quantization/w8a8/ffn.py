@@ -13,6 +13,8 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
+from ...optimizations.config import feature_enabled, supports_local_dense
+
 
 class QuantizedTokens(NamedTuple):
     values: torch.Tensor
@@ -215,12 +217,7 @@ class GateQuantizedRMSNorm(nn.Module):
 
 def install_gate_norm_quant(model, config, vendor):
     """Fuse only edges whose next opaque norm already materializes BF16 residual."""
-    extra = config.additional_config
-    enabled = (
-        extra.get("ffn_gate_norm_quant", False) if isinstance(extra, dict) else False
-    )
-    if type(enabled) is not bool:
-        raise ValueError("ffn_gate_norm_quant must be a boolean")
+    enabled = feature_enabled(config, "ffn_gate_norm_quant")
     if not enabled or vendor != "iluvatar":
         return 0
     from vllm.model_executor.models.llama import LlamaDecoderLayer
@@ -307,22 +304,11 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     The optional linear_swiglu_fusion pass can fuse this projection's INT8
     operation with its activation. If it cannot match, this path stays unfused.
     """
-    extra = config.additional_config
-    enabled = extra.get("ffn_w8a8", False) if isinstance(extra, dict) else False
-    if type(enabled) is not bool:
-        raise ValueError("ffn_w8a8 must be a boolean")
-    norm_fusion = (
-        extra.get("ffn_gate_norm_quant", False) if isinstance(extra, dict) else False
-    )
-    if type(norm_fusion) is not bool:
-        raise ValueError("ffn_gate_norm_quant must be a boolean")
+    enabled = feature_enabled(config, "ffn_w8a8")
+    norm_fusion = feature_enabled(config, "ffn_gate_norm_quant")
     if norm_fusion and vendor_name != "iluvatar":
         raise ValueError("deferred gate norm is supported only on Iluvatar")
-    interleaved = (
-        extra.get("ffn_w8a8_interleaved", False) if isinstance(extra, dict) else False
-    )
-    if type(interleaved) is not bool:
-        raise ValueError("ffn_w8a8_interleaved must be a boolean")
+    interleaved = feature_enabled(config, "ffn_w8a8_interleaved")
     if interleaved and not enabled:
         raise ValueError("ffn_w8a8_interleaved requires ffn_w8a8")
     if interleaved and vendor_name != "metax":
@@ -330,7 +316,6 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     if not enabled:
         return 0
 
-    from vllm.config import CompilationMode
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.model_executor.layers.linear import (
         MergedColumnParallelLinear,
@@ -342,26 +327,9 @@ def install_ffn_w8a8(model, config, vendor_name: str) -> int:
     from vllm_fl.ops.layernorm import RMSNormFL
     from vllm_fl.utils import is_oot_enabled, use_flaggems_op
 
-    mc, pc = config.model_config, config.parallel_config
     if (
         vendor_name not in ("metax", "iluvatar")
-        or mc.dtype != torch.bfloat16
-        or mc.runner_type != "generate"
-        or mc.is_encoder_decoder
-        or mc.multimodal_config is not None
-        or config.quant_config is not None
-        or config.lora_config is not None
-        or config.speculative_config is not None
-        or pc.tensor_parallel_size != 1
-        or pc.pipeline_parallel_size != 1
-        or pc.data_parallel_size != 1
-        or pc.decode_context_parallel_size != 1
-        or pc.prefill_context_parallel_size != 1
-        or pc.use_ubatching
-        or config.kv_transfer_config is not None
-        or config.offload_config.uva.cpu_offload_gb > 0
-        or config.offload_config.prefetch.offload_group_size > 0
-        or config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+        or not supports_local_dense(config)
         or not is_oot_enabled()
         or not use_flaggems_op("rms_norm")
     ):

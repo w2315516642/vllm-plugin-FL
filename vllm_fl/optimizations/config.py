@@ -69,3 +69,38 @@ def feature_enabled(config, name):
     if type(value) is not bool:
         raise ValueError(f"{name} must be a boolean")
     return value
+
+
+def supports_local_dense(config, *, allow_stock_compile=False):
+    """Common contract for model-local dense extensions, without changing routes."""
+    import torch
+    from vllm.config import CompilationMode
+
+    mc, pc = config.model_config, config.parallel_config
+    return (
+        mc.dtype == torch.bfloat16
+        and mc.runner_type == "generate"
+        and not mc.is_encoder_decoder
+        and mc.multimodal_config is None
+        and config.quant_config is None
+        and config.lora_config is None
+        and config.speculative_config is None
+        and config.kv_transfer_config is None
+        and all(
+            getattr(pc, name) == 1
+            for name in (
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "data_parallel_size",
+                "decode_context_parallel_size",
+                "prefill_context_parallel_size",
+            )
+        )
+        and not pc.use_ubatching
+        and config.offload_config.uva.cpu_offload_gb <= 0
+        and config.offload_config.prefetch.offload_group_size <= 0
+        and (
+            allow_stock_compile
+            or config.compilation_config.mode != CompilationMode.STOCK_TORCH_COMPILE
+        )
+    )

@@ -180,6 +180,7 @@ def kernel_unified_attention(
     task_seq_ptr,
     task_block_ptr,
     HAS_TASK_PLAN: tl.constexpr,
+    MIXED_BATCH: tl.constexpr,
     # Output destination for the 2D path.  In 3D mode per-segment partials
     # go to the ``segm_*`` tensors (see bottom of signature) and
     # ``output_ptr`` is unused (callers may pass any non-null pointer).
@@ -243,6 +244,10 @@ def kernel_unified_attention(
     # to ``[segm_idx, segm_idx+1) × tiles_per_segment`` and writes
     # per-segment partials, finalized by ``reduce_segments``.
     IS_3D: tl.constexpr,
+    DIRECT_DECODE: tl.constexpr,
+    DEFER_LSUM: tl.constexpr,
+    COMPACT_ROWS: tl.constexpr,
+    COMPACT_ACC: tl.constexpr,
     # Parameters below default to None so Triton can skip materialising them
     # on call sites where the corresponding constexpr branch is dead.
     # Credit: @quinnlp identified this as a perf regression source in
@@ -291,7 +296,19 @@ def kernel_unified_attention(
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2) if IS_3D else 0
 
-    if HAS_TASK_PLAN:
+    if DIRECT_DECODE:
+        # Metadata guarantees at most one query token per sequence. Read
+        # starts rather than assuming token index == sequence index, so
+        # zero-query entries (including graph padding) remain supported.
+        seq_idx = q_block_global_idx
+        q_block_local_idx = 0
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+        query_end = tl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_query_len = query_end - cur_batch_in_all_start_index
+        if MIXED_BATCH and cur_batch_query_len != 1:
+            return
+        seq_len = tl.load(seq_lens_ptr + seq_idx)
+    elif HAS_TASK_PLAN:
         seq_idx = tl.load(task_seq_ptr + q_block_global_idx)
         if seq_idx < 0:
             return
@@ -374,9 +391,21 @@ def kernel_unified_attention(
     M = init_softmax_M(
         sink_ptr, query_offset_1, query_mask_1, segm_idx, BLOCK_M, USE_SINKS, IS_3D
     )
-    L = tl.full([BLOCK_M], 1.0 if USE_SINKS else 0.0, dtype=tl.float32)
+    ACTIVE_M: tl.constexpr = BLOCK_M // 2 if COMPACT_ROWS else BLOCK_M
+    if COMPACT_ROWS:
+        tl.static_assert(
+            BLOCK_M == 16 and num_queries_per_kv == 8 and DEFER_LSUM and not USE_SINKS
+        )
+        M = tl.full((ACTIVE_M,), float("-inf"), tl.float32)
+    L = tl.full([ACTIVE_M], 1.0 if USE_SINKS else 0.0, dtype=tl.float32)
+    if DEFER_LSUM:
+        # Per-column partial denominators, rescaled by the same row alpha.
+        # Their row sum equals the conventional scalar denominator in exact
+        # arithmetic. Do not apply this zero initialization to sink paths.
+        L_partial = tl.zeros((ACTIVE_M, TILE_SIZE), dtype=tl.float32)
     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-    acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+    ACC_M: tl.constexpr = ACTIVE_M if COMPACT_ACC else BLOCK_M
+    acc = tl.zeros([ACC_M, HEAD_SIZE_PADDED], dtype=tl.float32)
     score_scale = scale
     value_scale = 1.0
     if USE_FP8_Q_DESCALE:
@@ -551,7 +580,30 @@ def kernel_unified_attention(
                 qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
             )
 
-        M, L, P, alpha = softmax_step(S, M, L)
+        if COMPACT_ROWS:
+            # First 8 rows are the 8 query heads for the sole query token.
+            # Keep MMA operands padded; trim only scalar softmax state.
+            S, unused_rows = tl.split(
+                tl.permute(tl.reshape(S, (2, ACTIVE_M, TILE_SIZE)), (1, 2, 0))
+            )
+        if DEFER_LSUM:
+            M_new = tl.maximum(M, tl.max(S, axis=1))
+            M_new = tl.where(M_new > float("-inf"), M_new, 0.0)
+            P = tl.exp(S - M_new[:, None])
+            alpha = tl.exp(M - M_new)
+            L_partial = L_partial * alpha[:, None] + P
+            M = M_new
+        else:
+            M, L, P, alpha = softmax_step(S, M, L)
+        if COMPACT_ROWS:
+            P = tl.reshape(
+                tl.permute(tl.join(P, tl.zeros_like(P)), (2, 0, 1)),
+                (BLOCK_M, TILE_SIZE),
+            )
+            if not COMPACT_ACC:
+                alpha = tl.reshape(
+                    tl.trans(tl.join(alpha, tl.zeros_like(alpha))), (BLOCK_M,)
+                )
         acc = acc * alpha[:, None]
 
         if SLIDING_WINDOW:
@@ -574,7 +626,35 @@ def kernel_unified_attention(
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
             acc += tl.dot(P_v, V)
         else:
-            acc += tl.dot(P.to(V.dtype), V)
+            if COMPACT_ACC:
+                acc_pad = tl.reshape(
+                    tl.permute(tl.join(acc, tl.zeros_like(acc)), (2, 0, 1)),
+                    (BLOCK_M, HEAD_SIZE_PADDED),
+                )
+                result_pad = tl.dot(P.to(V.dtype), V, acc_pad)
+                acc, unused_acc = tl.split(
+                    tl.permute(
+                        tl.reshape(result_pad, (2, ACTIVE_M, HEAD_SIZE_PADDED)),
+                        (1, 2, 0),
+                    )
+                )
+            else:
+                acc += tl.dot(P.to(V.dtype), V)
+
+    if DEFER_LSUM:
+        L = tl.sum(L_partial, axis=1)
+
+    if COMPACT_ROWS:
+        M = tl.reshape(
+            tl.trans(tl.join(M, tl.full((ACTIVE_M,), float("-inf"), tl.float32))),
+            (BLOCK_M,),
+        )
+        L = tl.reshape(tl.trans(tl.join(L, tl.zeros_like(L))), (BLOCK_M,))
+        if COMPACT_ACC:
+            acc = tl.reshape(
+                tl.permute(tl.join(acc, tl.zeros_like(acc)), (2, 0, 1)),
+                (BLOCK_M, HEAD_SIZE_PADDED),
+            )
 
     # ---- Epilogue ---------------------------------------------------------
     if IS_3D:
@@ -609,7 +689,11 @@ def kernel_unified_attention(
             )
         else:
             segm_output_offset = (
-                query_offset_0[:, None].to(tl.int64)
+                (
+                    tl.full((BLOCK_M, 1), seq_idx, tl.int64)
+                    if MIXED_BATCH
+                    else query_offset_0[:, None].to(tl.int64)
+                )
                 * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
                 + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
                 + segm_idx * HEAD_SIZE_PADDED
@@ -623,7 +707,7 @@ def kernel_unified_attention(
         store_segm_reduce_scalars(
             segm_max_ptr,
             segm_expsum_ptr,
-            query_offset_0,
+            tl.full((BLOCK_M,), seq_idx, tl.int32) if MIXED_BATCH else query_offset_0,
             query_offset_1,
             segm_idx,
             M,
@@ -676,6 +760,7 @@ def kernel_unified_attention(
 
 @triton.jit
 def reduce_segments(
+    MIXED_BATCH: tl.constexpr,
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     segm_output_ptr,
     # [num_tokens, num_query_heads, max_num_segments, head_size]
@@ -698,13 +783,20 @@ def reduce_segments(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
-    query_token_idx = tl.program_id(0)
-    query_head_idx = tl.program_id(1)
+    if MIXED_BATCH:
+        seq_idx = tl.program_id(0)
+        query_head_idx = tl.program_id(1)
+        query_token_idx = tl.load(query_start_len_ptr + seq_idx)
+        query_end = tl.load(query_start_len_ptr + seq_idx + 1)
+        if query_end - query_token_idx != 1:
+            return
+    else:
+        query_token_idx = tl.program_id(0)
+        query_head_idx = tl.program_id(1)
 
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
-    )
-
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
+        )
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
@@ -721,7 +813,8 @@ def reduce_segments(
 
     # load segment maxima
     segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        (seq_idx if MIXED_BATCH else query_token_idx).to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_head_idx * NUM_SEGMENTS_PER_SEQ
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
     )
@@ -735,7 +828,7 @@ def reduce_segments(
 
     # load, rescale, and add segment attention outputs
     segm_output_offset = (
-        query_token_idx.to(tl.int64)
+        (seq_idx if MIXED_BATCH else query_token_idx).to(tl.int64)
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
         + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
@@ -842,6 +935,10 @@ def unified_attention(
     decode_num_stages: int = 3,
     task_seq=None,
     task_block=None,
+    mixed_batch: bool = False,
+    direct_decode: bool = False,
+    defer_lsum: bool = True,
+    decode_row_mode: str = "full",
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -1076,6 +1173,39 @@ def unified_attention(
         if prefill_num_stages is not None:
             launch_num_stages = prefill_num_stages
 
+    # CPU-side shape/dispatch metadata only; no tensor readback/sync.
+    # Direct mapping applies only to the segmented single-query decode path.
+    direct_decode_enabled = direct_decode and use_3d and max_seqlen_q == 1
+    if direct_decode_enabled:
+        total_num_q_blocks = num_seqs
+
+    compact_rows = decode_row_mode in ("compact", "compact_acc")
+    if decode_row_mode != "full":
+        assert decode_row_mode in ("bm8", "compact", "compact_acc")
+        assert (
+            direct_decode_enabled
+            and q.dtype == torch.bfloat16
+            and head_size == 128
+            and num_queries_per_kv == 8
+            and kv_quant_mode == KVQuantMode.NONE
+            and not use_td
+            and use_causal
+            and not use_per_seq_causal
+            and window_size == (-1, -1)
+            and chunk_lookback == -1
+            and alibi_slopes is None
+            and qq_bias is None
+            and sinks is None
+            and mm_prefix_range is None
+            and softcap == 0
+            and output_scale is None
+            and defer_lsum
+            and not is_batch_invariant
+        )
+        if decode_row_mode == "bm8":
+            BLOCK_M = 8
+            BLOCK_Q = 1
+
     grid: tuple[Any, ...]
     if not use_3d:
         grid = (total_num_q_blocks, num_kv_heads)
@@ -1094,6 +1224,7 @@ def unified_attention(
         task_seq_ptr=task_seq,
         task_block_ptr=task_block,
         HAS_TASK_PLAN=task_seq is not None,
+        MIXED_BATCH=mixed_batch,
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
         segm_max_ptr=segm_max_ptr,
@@ -1159,6 +1290,27 @@ def unified_attention(
         NUM_SEGMENTS_PER_SEQ=num_segments,
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
+        DIRECT_DECODE=direct_decode_enabled,
+        COMPACT_ROWS=compact_rows,
+        COMPACT_ACC=decode_row_mode == "compact_acc",
+        DEFER_LSUM=(
+            defer_lsum
+            and direct_decode_enabled
+            and q.dtype == torch.bfloat16
+            and head_size in (64, 128)
+            and kv_quant_mode == KVQuantMode.NONE
+            and use_causal
+            and not use_per_seq_causal
+            and window_size == (-1, -1)
+            and chunk_lookback == -1
+            and sinks is None
+            and alibi_slopes is None
+            and qq_bias is None
+            and mm_prefix_range is None
+            and softcap == 0
+            and output_scale is None
+            and not use_td
+        ),
         KV_QUANT_MODE=kv_quant_mode,
         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
         CHUNK_LOOKBACK=chunk_lookback,
@@ -1169,7 +1321,8 @@ def unified_attention(
     )
 
     if use_3d:
-        reduce_segments[(q.shape[0], num_query_heads)](
+        reduce_segments[(num_seqs if mixed_batch else q.shape[0], num_query_heads)](
+            MIXED_BATCH=mixed_batch,
             output_ptr=out,
             segm_output_ptr=softmax_segm_output,
             segm_max_ptr=softmax_segm_max,

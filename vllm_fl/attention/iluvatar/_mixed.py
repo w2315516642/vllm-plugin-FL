@@ -3,7 +3,9 @@
 import torch
 import triton
 import triton.language as tl
-from . import _unified as mixed_prefill, _decode as mixed_decode
+from vllm.forward_context import get_forward_context
+
+from ._unified import unified_attention
 from .impl import tuned_unified_attention as baseline
 
 
@@ -71,7 +73,7 @@ def run(kwargs, plan, *, prepare=True):
         task_seq=plan.seq,
         task_block=plan.block,
     )
-    mixed_prefill.unified_attention(**opts)
+    unified_attention(**opts)
     opts = dict(kwargs)
     opts.update(
         max_seqlen_q=1,
@@ -88,11 +90,8 @@ def run(kwargs, plan, *, prepare=True):
         decode_row_mode="bm8",
         mixed_batch=True,
     )
-    mixed_decode.unified_attention(**opts)
+    unified_attention(**opts)
     return kwargs["out"]
-
-
-from vllm.forward_context import get_forward_context
 
 
 def mixed_attention(kwargs):

@@ -5,7 +5,7 @@ import torch
 
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
-from .config import feature_enabled
+from .config import feature_enabled, supports_local_dense
 
 
 @torch.library.custom_op("vllm_fl::bf16_linear", mutates_args=())
@@ -67,25 +67,7 @@ def install_model_optimizations(model, config, vendor):
 
     from vllm_fl.attention.iluvatar.impl import TunedTritonAttentionImpl
 
-    mc, pc = config.model_config, config.parallel_config
-    if (
-        mc.dtype != torch.bfloat16
-        or mc.runner_type != "generate"
-        or mc.is_encoder_decoder
-        or mc.multimodal_config is not None
-        or config.quant_config is not None
-        or config.lora_config is not None
-        or config.speculative_config is not None
-        or config.kv_transfer_config is not None
-        or pc.tensor_parallel_size != 1
-        or pc.pipeline_parallel_size != 1
-        or pc.data_parallel_size != 1
-        or pc.decode_context_parallel_size != 1
-        or pc.prefill_context_parallel_size != 1
-        or pc.use_ubatching
-        or config.offload_config.uva.cpu_offload_gb > 0
-        or config.offload_config.prefetch.offload_group_size > 0
-    ):
+    if not supports_local_dense(config, allow_stock_compile=True):
         return counts
     for module in model.modules():
         if tune_linear and type(module) is LlamaMLP:
@@ -116,3 +98,49 @@ def install_model_optimizations(model, config, vendor):
             module.impl = TunedTritonAttentionImpl.from_impl(impl)
             counts["triton_attention"] += 1
     return counts
+
+
+def configure_model(model, config, vendor):
+    """Install paired components after loading; return tail and Graph policies."""
+    from vllm.logger import init_logger
+    from ..quantization.w8a8.ffn import install_ffn_w8a8, install_gate_norm_quant
+    from ..quantization.w8a8.projections import (
+        install_ffn_down_w8a8,
+        install_attention_o_w8a8,
+        install_qkv_w8a8,
+    )
+    from ..worker.prefill_tail import make_prefill_tail
+
+    logger = init_logger(__name__)
+    components = (
+        (install_ffn_w8a8, "Enabled gate/up W8A8 for %d FFNs"),
+        (install_ffn_down_w8a8, "Enabled down W8A8 for %d FFNs"),
+        (install_attention_o_w8a8, "Enabled O projection W8A8 for %d attention layers"),
+        (install_qkv_w8a8, "Enabled paired RMSNorm/QKV W8A8 for %d layers"),
+        (install_gate_norm_quant, "Enabled paired gate Norm/quant for %d layers"),
+    )
+    for install, message in components:
+        count = install(model, config, vendor)
+        if count:
+            logger.info(message, count)
+
+    optimized = install_model_optimizations(model, config, vendor)
+    if any(optimized.values()):
+        logger.info("Installed model-local optimizations: %s", optimized)
+    tail = (
+        make_prefill_tail(model, config)
+        if feature_enabled(config, "prefill_tail")
+        else None
+    )
+    if tail is not None:
+        logger.info("Enabled demand-driven final-layer prefill computation")
+    graphs = None
+    if optimized["triton_attention"] and feature_enabled(config, "quest_attention"):
+        from ..attention.iluvatar._rope import install
+
+        graphs = install(model, config)
+        if graphs is not None:
+            logger.info(
+                "Enabled model-local Quest, RoPE/KV fusion and page-capacity Graphs"
+            )
+    return tail, graphs
